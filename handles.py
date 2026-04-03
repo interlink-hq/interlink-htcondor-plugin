@@ -983,23 +983,156 @@ def StopHandler():
         return error_response(f"Deletion failed: {str(e)}", 500)
 
 
+def parse_cluster_resources_from_json(stdout):
+    """Parse ``condor_status --json`` output into a PingResponse dict.
+
+    Available resources are computed as the sum of ``Cpus`` and ``Memory``
+    across all Unclaimed slots.  Dynamic child-slots (``DynamicSlot=True``)
+    are excluded to avoid double-counting with their partitionable-slot
+    parents, which already advertise the remaining (unclaimed) capacity.
+
+    Aligned with the interlink-hq/interLink#516 PingResponse schema so the
+    virtual kubelet can call ``updateNodeResources()`` on every heartbeat.
+
+    Args:
+        stdout: String output from ``condor_status --json``.
+
+    Returns:
+        dict with ``status`` and ``resources`` keys (cpu/memory as Kubernetes
+        quantity strings, e.g. ``"24"`` and ``"96000Mi"``).
+
+    Raises:
+        ValueError: If *stdout* cannot be parsed or contains no slots.
+
+    TODO: Replace the locally-defined PingResponse dict with the upstream
+    commonIL.PingResponse type once interlink-hq/interLink#516 is merged and
+    the interLink dependency is updated.
+    """
+    try:
+        slots = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"condor_status --json parse error: {e}") from e
+
+    if not isinstance(slots, list) or len(slots) == 0:
+        raise ValueError("condor_status --json returned no slots")
+
+    avail_cpus = 0
+    avail_mem_mb = 0
+    for slot in slots:
+        # Skip dynamic child-slots to avoid double-counting with partitionable
+        # slot parents which already advertise remaining (unclaimed) capacity.
+        if slot.get("DynamicSlot", False):
+            continue
+        if slot.get("State", "") == "Unclaimed":
+            avail_cpus += slot.get("Cpus", 0)
+            avail_mem_mb += slot.get("Memory", 0)
+
+    return {
+        "status": "ok",
+        "resources": {
+            "cpu": str(avail_cpus),
+            "memory": f"{avail_mem_mb}Mi",
+        },
+    }
+
+
+def parse_cluster_resources_from_text(stdout):
+    """Parse ``condor_status -autoformat Cpus Memory`` output into a PingResponse dict.
+
+    Each non-empty line is expected to contain two whitespace-separated
+    integers: CPUs and memory in MB.  Lines that cannot be parsed are
+    silently skipped.
+
+    NOTE: Unlike :func:`parse_cluster_resources_from_json` which reports
+    *available* resources, this function sums the total installed CPUs and
+    memory because plain-text ``condor_status`` output does not include
+    per-slot allocation state.
+
+    Args:
+        stdout: String output from ``condor_status -autoformat Cpus Memory``.
+
+    Returns:
+        dict with ``status`` and ``resources`` keys (cpu/memory as Kubernetes
+        quantity strings).
+    """
+    total_cpus = 0
+    total_mem_mb = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            cpu = int(parts[0])
+            mem = int(parts[1])
+        except ValueError:
+            continue
+        total_cpus += cpu
+        total_mem_mb += mem
+
+    return {
+        "status": "ok",
+        "resources": {
+            "cpu": str(total_cpus),
+            "memory": f"{total_mem_mb}Mi",
+        },
+    }
+
+
+def get_cluster_resources():
+    """Query HTCondor for current cluster resource availability.
+
+    Tries ``condor_status --json`` first for accurate per-slot available
+    CPU and memory data.  Falls back to
+    ``condor_status -autoformat Cpus Memory`` (total capacity) when JSON
+    output is unavailable or cannot be parsed.
+
+    Returns:
+        dict aligned with the interLink#516 PingResponse schema.
+    """
+    try:
+        process = os.popen("condor_status --json 2>/dev/null")
+        stdout = process.read()
+        process.close()
+        if stdout.strip():
+            return parse_cluster_resources_from_json(stdout)
+    except (OSError, ValueError) as e:
+        logging.debug(
+            f"condor_status --json unavailable ({e}), falling back to text parsing"
+        )
+
+    # Fallback: plain-text condor_status
+    process = os.popen("condor_status -autoformat Cpus Memory 2>/dev/null")
+    stdout = process.read()
+    process.close()
+    return parse_cluster_resources_from_text(stdout)
+
+
 def StatusHandler():
     # READ THE REQUEST #####################
     logging.info("HTCondor Sidecar: received GetStatus call")
     try:
         request_data_string = request.data.decode("utf-8")
         req_list = json.loads(request_data_string)
-        # Handle ping requests (empty array)
+        # Handle ping requests (empty array): return cluster resource availability
+        # as JSON so the virtual kubelet can update the node's advertised capacity.
+        # This path is triggered by the interlink-api ping call (interLink#516).
         if isinstance(req_list, list) and len(req_list) == 0:
-            logging.info("Received ping request")
-            if args.proxy and os.path.isfile(args.proxy):
-                return success_response(
-                    {"message": "HTCondor sidecar is alive", "status": "healthy"}, 200
-                )
-            else:
+            logging.info(
+                "Received ping request (empty pod list), returning cluster resource availability"
+            )
+            if args.proxy and not os.path.isfile(args.proxy):
                 return error_response(
                     "HTCondor sidecar not ready - proxy file not available", 503
                 )
+            try:
+                ping_resp = get_cluster_resources()
+            except OSError as e:
+                logging.warning(f"Failed to query HTCondor cluster resources: {e}")
+                ping_resp = {"status": "ok"}
+            return jsonify(ping_resp), 200
         # Validate request format
         if not isinstance(req_list, list):
             return error_response("Status request must be an array", 400)
