@@ -113,6 +113,7 @@ EOF
 # ---------------------------------------------------------------------------
 echo "Setting up Python environment..."
 python3 -m venv .venv
+# shellcheck source=/dev/null
 source .venv/bin/activate
 pip3 install -e ./ || {
   echo "ERROR: Failed to install vk-test-set"

@@ -702,7 +702,15 @@ def htcondor_batch_submit(job):
     schedd = args.schedd_host
     if collector and schedd:
         # Remote submission: forward the job to a specific pool and schedd.
-        cmd = ["condor_submit", "-pool", collector, "-remote", schedd, job_real, "-spool"]
+        cmd = [
+            "condor_submit",
+            "-pool",
+            collector,
+            "-remote",
+            schedd,
+            job_real,
+            "-spool",
+        ]
     else:
         # Local submission: use the schedd discovered from the local HTCondor pool.
         cmd = ["condor_submit", job_real]
@@ -717,9 +725,7 @@ def htcondor_batch_submit(job):
     # Expected output: "1 job(s) submitted to cluster 12345."
     parts = preprocessed.strip().split(" ")
     if not parts:
-        raise RuntimeError(
-            f"Unexpected condor_submit output: {preprocessed!r}"
-        )
+        raise RuntimeError(f"Unexpected condor_submit output: {preprocessed!r}")
     jid = parts[-1].split(".")[0].strip()
     if not jid.isdigit():
         raise RuntimeError(

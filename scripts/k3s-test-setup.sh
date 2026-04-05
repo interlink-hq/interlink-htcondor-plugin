@@ -123,7 +123,33 @@ chmod +x "${TEST_DIR}/virtual-kubelet"
 echo "✓ interLink binaries downloaded (version ${INTERLINK_VERSION})"
 
 # ---------------------------------------------------------------------------
-# Generate config files
+# Start htcondor-sidecar container
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Starting htcondor-sidecar container ==="
+docker run -d --name htcondor-sidecar \
+  --privileged \
+  -p 8000:8000 \
+  htcondor-sidecar:local
+
+sleep 5
+if ! docker ps --filter "name=htcondor-sidecar" --filter "status=running" \
+    | grep -q htcondor-sidecar; then
+  echo "ERROR: htcondor-sidecar container failed to start"
+  docker logs htcondor-sidecar 2>&1 || true
+  exit 1
+fi
+echo "✓ htcondor-sidecar container started"
+
+# Resolve the container's IP on the Docker bridge so the interLink API can
+# reach the sidecar without triggering the SSRF guard (which blocks localhost).
+SIDECAR_IP=$(docker inspect \
+  -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+  htcondor-sidecar)
+echo "  Sidecar IP: ${SIDECAR_IP}"
+
+# ---------------------------------------------------------------------------
+# Generate config files (after container start so we can use SIDECAR_IP)
 # ---------------------------------------------------------------------------
 mkdir -p "${TEST_DIR}/interlink-data"
 
@@ -131,7 +157,7 @@ mkdir -p "${TEST_DIR}/interlink-data"
 cat > "${TEST_DIR}/interlink-config.yaml" <<EOF
 InterlinkAddress: "http://0.0.0.0"
 InterlinkPort: "3000"
-SidecarURL: "http://localhost"
+SidecarURL: "http://${SIDECAR_IP}"
 SidecarPort: "8000"
 VerboseLogging: true
 ErrorsOnlyLogging: false
@@ -161,25 +187,6 @@ Resources:
 EOF
 
 echo "✓ Config files generated"
-
-# ---------------------------------------------------------------------------
-# Start htcondor-sidecar container
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Starting htcondor-sidecar container ==="
-docker run -d --name htcondor-sidecar \
-  --privileged \
-  -p 8000:8000 \
-  htcondor-sidecar:local
-
-sleep 5
-if ! docker ps --filter "name=htcondor-sidecar" --filter "status=running" \
-    | grep -q htcondor-sidecar; then
-  echo "ERROR: htcondor-sidecar container failed to start"
-  docker logs htcondor-sidecar 2>&1 || true
-  exit 1
-fi
-echo "✓ htcondor-sidecar container started"
 
 # Wait for HTCondor daemons to initialise inside the container
 echo "Waiting for HTCondor daemons to initialise..."

@@ -2,11 +2,13 @@ FROM htcondor/mini:23.0.25-el9
 
 # Install EPEL and Apptainer for running Singularity container jobs,
 # plus Flask and pyyaml for the plugin HTTP server.
+# hadolint ignore=DL3041
 RUN dnf install -y epel-release && \
     dnf install -y apptainer && \
     dnf clean all && \
     rm -rf /var/cache/dnf/*
 
+# hadolint ignore=DL3013
 RUN pip3 install flask pyyaml
 
 # Expose apptainer as 'singularity' so existing plugin scripts resolve it.
