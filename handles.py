@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -346,6 +347,25 @@ def mount_empty_dir(container, pod):
     return ed_path
 
 
+def parse_cpu(value_str):
+    """Parse a Kubernetes CPU value and return an integer number of CPUs (>=1).
+
+    Kubernetes CPU can be expressed as:
+      - Plain integer or float: "1", "2", "0.5"
+      - Millicores: "100m", "500m", "1000m"
+
+    HTCondor RequestCpus requires a whole number, so we round up with a
+    minimum of 1.
+    """
+    value_str = str(value_str).strip()
+    if value_str.endswith("m"):
+        millicores = float(value_str[:-1])
+        cpus = millicores / 1000.0
+    else:
+        cpus = float(value_str)
+    return max(1, int(math.ceil(cpus)))
+
+
 def parse_string_with_suffix(value_str):
     # should return MB because HTCondor wants MB
     suffixes = {
@@ -547,7 +567,7 @@ def produce_htcondor_singularity_script(
         if "resources" in c.keys():
             if "requests" in c["resources"].keys():
                 if "cpu" in c["resources"]["requests"].keys():
-                    requested_cpus += int(c["resources"]["requests"]["cpu"])
+                    requested_cpus += parse_cpu(c["resources"]["requests"]["cpu"])
                 if "memory" in c["resources"]["requests"].keys():
                     requested_memory += parse_string_with_suffix(
                         c["resources"]["requests"]["memory"]
@@ -651,13 +671,11 @@ def produce_htcondor_host_script(container, metadata):
     try:
         with open(executable_path, "w") as f:
             batch_macros = f"""#!{container['command'][-1]}
-""" + "\n".join(
-                container["args"][-1].split("; ")
-            )
+""" + "\n".join(container["args"][-1].split("; "))
 
             f.write(batch_macros)
 
-        requested_cpu = container["resources"]["requests"]["cpu"]
+        requested_cpu = parse_cpu(container["resources"]["requests"]["cpu"])
         # requested_memory = int(container['resources']['requests']['memory'])/1e6
         requested_memory = container["resources"]["requests"]["memory"]
         job = f"""
