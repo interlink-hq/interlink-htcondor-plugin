@@ -689,12 +689,42 @@ Queue 1
 
 def htcondor_batch_submit(job):
     logging.info("Submitting HTCondor job")
+
+    # Resolve to an absolute path so the argument can never be confused with
+    # a flag (e.g. a pod whose name begins with '-'), and validate that the
+    # file stays inside the configured DataRootFolder.
+    data_root = os.path.realpath(InterLinkConfigInst["DataRootFolder"])
+    job_real = os.path.realpath(job)
+    if not (job_real == data_root or job_real.startswith(data_root + os.sep)):
+        raise ValueError(f"Submit file path escapes data root: {job!r}")
+
     collector = args.collector_host
     schedd = args.schedd_host
-    process = os.popen(f"condor_submit -pool {collector} -remote {schedd} {job} -spool")
-    preprocessed = process.read()
-    process.close()
-    jid = preprocessed.split(" ")[-1].split(".")[0]
+    if collector and schedd:
+        # Remote submission: forward the job to a specific pool and schedd.
+        cmd = ["condor_submit", "-pool", collector, "-remote", schedd, job_real, "-spool"]
+    else:
+        # Local submission: use the schedd discovered from the local HTCondor pool.
+        cmd = ["condor_submit", job_real]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"condor_submit failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+
+    preprocessed = result.stdout
+    # Expected output: "1 job(s) submitted to cluster 12345."
+    parts = preprocessed.strip().split(" ")
+    if not parts:
+        raise RuntimeError(
+            f"Unexpected condor_submit output: {preprocessed!r}"
+        )
+    jid = parts[-1].split(".")[0].strip()
+    if not jid.isdigit():
+        raise RuntimeError(
+            f"Could not parse cluster ID from condor_submit output: {preprocessed!r}"
+        )
 
     return jid
 
