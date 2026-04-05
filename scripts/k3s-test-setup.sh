@@ -203,8 +203,23 @@ done
 if [ "${condor_ready}" -ne 1 ]; then
   echo "ERROR: condor_status not responding after 150 s — HTCondor failed to start"
   echo ""
-  echo "=== htcondor-sidecar container logs ==="
+  echo "=== htcondor-sidecar container stdout/stderr ==="
   docker logs htcondor-sidecar 2>&1 || true
+  echo ""
+  echo "=== HTCondor MasterLog ==="
+  docker exec htcondor-sidecar cat /var/log/condor/MasterLog 2>/dev/null || true
+  echo ""
+  echo "=== HTCondor StartLog ==="
+  docker exec htcondor-sidecar cat /var/log/condor/StartLog 2>/dev/null || true
+  echo ""
+  echo "=== HTCondor CollectorLog ==="
+  docker exec htcondor-sidecar cat /var/log/condor/CollectorLog 2>/dev/null || true
+  echo ""
+  echo "=== HTCondor NegotiatorLog ==="
+  docker exec htcondor-sidecar cat /var/log/condor/NegotiatorLog 2>/dev/null || true
+  echo ""
+  echo "=== HTCondor SchedLog ==="
+  docker exec htcondor-sidecar cat /var/log/condor/SchedLog 2>/dev/null || true
   exit 1
 fi
 echo "✓ HTCondor daemons are ready"
