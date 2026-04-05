@@ -2,12 +2,16 @@ FROM htcondor/mini:23.0.25-el9
 
 # Install EPEL and Apptainer for running Singularity container jobs,
 # plus Flask and pyyaml for the plugin HTTP server.
+# Version pinning is skipped because: epel-release has no meaningful version
+# to pin on el9, and apptainer's latest stable is always what we want here.
 # hadolint ignore=DL3041
 RUN dnf install -y epel-release && \
     dnf install -y apptainer && \
     dnf clean all && \
     rm -rf /var/cache/dnf/*
 
+# Version pinning skipped: these are runtime dependencies of the plugin itself
+# and are kept at their latest compatible releases to match the plugin source.
 # hadolint ignore=DL3013
 RUN pip3 install flask pyyaml
 
