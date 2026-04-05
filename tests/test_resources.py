@@ -286,3 +286,143 @@ class TestPingPathIntegration:
         assert resp.status_code == 200
         data = _json.loads(resp.data)
         assert data["resources"]["cpu"] == "8"
+
+
+# ---------------------------------------------------------------------------
+# get_taints_from_config
+# ---------------------------------------------------------------------------
+
+
+class TestGetTaintsFromConfig:
+    """Tests for get_taints_from_config() — reads Taints from SidecarConfig."""
+
+    def test_no_taints_key_returns_none(self, monkeypatch):
+        monkeypatch.setattr(handles, "InterLinkConfigInst", {"DataRootFolder": ".knoc/"})
+        assert handles.get_taints_from_config() is None
+
+    def test_taints_absent_means_no_taints_field_in_ping(self, monkeypatch):
+        """When Taints is not in config, ping response must NOT include 'taints'."""
+        monkeypatch.setattr(handles, "InterLinkConfigInst", {"DataRootFolder": ".knoc/"})
+        slots = [{"Cpus": 2, "Memory": 4096, "State": "Unclaimed"}]
+        monkeypatch.setattr(os, "popen", TestPingPathIntegration._make_fake_popen(_json.dumps(slots)))
+        monkeypatch.setattr(handles, "args", mock.MagicMock(proxy=""))
+        resp = _flask_test_client().get(
+            "/status", data=_json.dumps([]), content_type="application/json"
+        )
+        data = _json.loads(resp.data)
+        assert "taints" not in data
+
+    def test_empty_taints_list_returns_empty_list(self, monkeypatch):
+        monkeypatch.setattr(handles, "InterLinkConfigInst", {"Taints": []})
+        result = handles.get_taints_from_config()
+        assert result == []
+
+    def test_empty_taints_list_included_in_ping(self, monkeypatch):
+        """Empty Taints list in config → 'taints: []' in ping (clears all plugin taints)."""
+        monkeypatch.setattr(handles, "InterLinkConfigInst", {"Taints": []})
+        slots = [{"Cpus": 2, "Memory": 4096, "State": "Unclaimed"}]
+        monkeypatch.setattr(os, "popen", TestPingPathIntegration._make_fake_popen(_json.dumps(slots)))
+        monkeypatch.setattr(handles, "args", mock.MagicMock(proxy=""))
+        resp = _flask_test_client().get(
+            "/status", data=_json.dumps([]), content_type="application/json"
+        )
+        data = _json.loads(resp.data)
+        assert "taints" in data
+        assert data["taints"] == []
+
+    def test_single_taint_no_value(self, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"Taints": [{"key": "example.com/no-schedule", "effect": "NoSchedule"}]},
+        )
+        result = handles.get_taints_from_config()
+        assert result == [{"key": "example.com/no-schedule", "effect": "NoSchedule"}]
+
+    def test_taint_with_value(self, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "Taints": [
+                    {"key": "example.com/gpu", "value": "true", "effect": "NoSchedule"}
+                ]
+            },
+        )
+        result = handles.get_taints_from_config()
+        assert len(result) == 1
+        assert result[0]["value"] == "true"
+
+    def test_multiple_taints(self, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "Taints": [
+                    {"key": "k1", "effect": "NoSchedule"},
+                    {"key": "k2", "value": "v2", "effect": "NoExecute"},
+                    {"key": "k3", "effect": "PreferNoSchedule"},
+                ]
+            },
+        )
+        result = handles.get_taints_from_config()
+        assert len(result) == 3
+        assert result[0] == {"key": "k1", "effect": "NoSchedule"}
+        assert result[1] == {"key": "k2", "value": "v2", "effect": "NoExecute"}
+        assert result[2] == {"key": "k3", "effect": "PreferNoSchedule"}
+
+    def test_invalid_entry_missing_key_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"Taints": [{"effect": "NoSchedule"}, {"key": "valid", "effect": "NoSchedule"}]},
+        )
+        result = handles.get_taints_from_config()
+        assert len(result) == 1
+        assert result[0]["key"] == "valid"
+
+    def test_invalid_entry_missing_effect_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"Taints": [{"key": "no-effect"}, {"key": "valid", "effect": "NoSchedule"}]},
+        )
+        result = handles.get_taints_from_config()
+        assert len(result) == 1
+        assert result[0]["key"] == "valid"
+
+    def test_non_dict_entry_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"Taints": ["badstring", {"key": "k", "effect": "NoSchedule"}]},
+        )
+        result = handles.get_taints_from_config()
+        assert len(result) == 1
+
+    def test_invalid_taints_type_returns_none(self, monkeypatch):
+        monkeypatch.setattr(handles, "InterLinkConfigInst", {"Taints": "not-a-list"})
+        assert handles.get_taints_from_config() is None
+
+    def test_taints_included_in_ping_response(self, monkeypatch):
+        """Configured taints must appear in the /status ping response."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"Taints": [{"key": "example.com/no-schedule", "effect": "NoSchedule"}]},
+        )
+        slots = [{"Cpus": 4, "Memory": 8192, "State": "Unclaimed"}]
+        monkeypatch.setattr(
+            os, "popen", TestPingPathIntegration._make_fake_popen(_json.dumps(slots))
+        )
+        monkeypatch.setattr(handles, "args", mock.MagicMock(proxy=""))
+        resp = _flask_test_client().get(
+            "/status", data=_json.dumps([]), content_type="application/json"
+        )
+        assert resp.status_code == 200
+        data = _json.loads(resp.data)
+        assert "taints" in data
+        assert len(data["taints"]) == 1
+        assert data["taints"][0]["key"] == "example.com/no-schedule"
+        assert data["taints"][0]["effect"] == "NoSchedule"
+

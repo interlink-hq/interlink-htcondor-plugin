@@ -1081,6 +1081,49 @@ def parse_cluster_resources_from_text(stdout):
     }
 
 
+def get_taints_from_config():
+    """Return the taint list from ``SidecarConfig.yaml``, or ``None`` if not configured.
+
+    When the ``Taints`` key is present in the config (even as an empty list),
+    the returned list is passed to the VK in the ping response so it can
+    replace the node's non-system taints (interLink#516 behaviour).
+    When the key is absent, ``None`` is returned and the ``taints`` field is
+    omitted from the ping response, leaving the node's existing taints intact.
+
+    Each taint dict must have a ``key`` and ``effect`` field (``value`` is
+    optional).  Invalid entries are skipped with a warning.
+
+    Returns:
+        list of taint dicts, or None.
+    """
+    raw = InterLinkConfigInst.get("Taints")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        logging.warning(
+            "SidecarConfig Taints must be a list; ignoring invalid value: %r", raw
+        )
+        return None
+
+    taints = []
+    for item in raw:
+        if not isinstance(item, dict):
+            logging.warning("Skipping non-dict taint entry: %r", item)
+            continue
+        key = item.get("key", "")
+        effect = item.get("effect", "")
+        if not key or not effect:
+            logging.warning(
+                "Skipping taint with missing key or effect: %r", item
+            )
+            continue
+        taint = {"key": key, "effect": effect}
+        if item.get("value"):
+            taint["value"] = item["value"]
+        taints.append(taint)
+    return taints
+
+
 def get_cluster_resources():
     """Query HTCondor for current cluster resource availability.
 
@@ -1132,6 +1175,12 @@ def StatusHandler():
             except OSError as e:
                 logging.warning(f"Failed to query HTCondor cluster resources: {e}")
                 ping_resp = {"status": "ok"}
+            # Add taints from config if configured (interLink#516).
+            # When present (even as []), the VK replaces non-system taints.
+            # When absent, the VK leaves existing taints unchanged.
+            taints = get_taints_from_config()
+            if taints is not None:
+                ping_resp["taints"] = taints
             return jsonify(ping_resp), 200
         # Validate request format
         if not isinstance(req_list, list):

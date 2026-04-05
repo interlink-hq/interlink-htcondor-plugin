@@ -1,3 +1,12 @@
 CommandPrefix: ""
 ExportPodData: true
 DataRootFolder: ".knoc/"
+# Taints is an optional list of Kubernetes taints to advertise on the virtual node
+# via the ping response (interLink#516).  When present (even as an empty list),
+# the VK replaces all non-system taints with this list; when absent, existing taints
+# are left unchanged.
+# Example:
+# Taints:
+#   - key: "example.com/no-schedule"
+#     value: ""
+#     effect: "NoSchedule"
