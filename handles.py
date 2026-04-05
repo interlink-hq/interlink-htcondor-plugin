@@ -1028,14 +1028,15 @@ def StatusHandler():
         # Handle ping requests (empty array)
         if isinstance(req_list, list) and len(req_list) == 0:
             logging.info("Received ping request")
-            if args.proxy and os.path.isfile(args.proxy):
-                return success_response(
-                    {"message": "HTCondor sidecar is alive", "status": "healthy"}, 200
-                )
-            else:
+            # If no proxy path is configured (local/mini HTCondor), skip the
+            # check entirely.  If a path is configured, verify the file exists.
+            if args.proxy and not os.path.isfile(args.proxy):
                 return error_response(
                     "HTCondor sidecar not ready - proxy file not available", 503
                 )
+            return success_response(
+                {"message": "HTCondor sidecar is alive", "status": "healthy"}, 200
+            )
         # Validate request format
         if not isinstance(req_list, list):
             return error_response("Status request must be an array", 400)

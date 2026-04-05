@@ -12,19 +12,17 @@ RUN dnf install -y epel-release && \
 
 # Version pinning skipped: these are runtime dependencies of the plugin itself
 # and are kept at their latest compatible releases to match the plugin source.
-# hadolint ignore=DL3013
-RUN pip3 install flask pyyaml
+# hadolint ignore=DL3013,DL3042
+RUN pip3 install --no-cache-dir flask pyyaml
 
-# Expose apptainer as 'singularity' so existing plugin scripts resolve it.
-RUN ln -sf /usr/bin/apptainer /usr/local/bin/singularity
-
+# Expose apptainer as 'singularity', create output dirs, and copy plugin files.
 COPY handles.py /utils/handles.py
 COPY probes.py /utils/probes.py
 COPY docker/SidecarConfig.yaml /utils/SidecarConfig.yaml
-RUN touch /utils/condor_config
-
-# Create HTCondor output directories and plugin data directories.
-RUN mkdir -p /utils/.interlink /utils/out /utils/err /utils/log
+# hadolint ignore=DL3059
+RUN ln -sf /usr/bin/apptainer /usr/local/bin/singularity && \
+    touch /utils/condor_config && \
+    mkdir -p /utils/.interlink /utils/out /utils/err /utils/log
 
 WORKDIR /utils
 
