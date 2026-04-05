@@ -983,23 +983,271 @@ def StopHandler():
         return error_response(f"Deletion failed: {str(e)}", 500)
 
 
+def parse_cluster_resources_from_json(stdout):
+    """Parse ``condor_status --json`` output into a PingResponse dict.
+
+    Available resources are computed as the sum of ``Cpus`` and ``Memory``
+    across all Unclaimed slots.  Dynamic child-slots (``DynamicSlot=True``)
+    are excluded to avoid double-counting with their partitionable-slot
+    parents, which already advertise the remaining (unclaimed) capacity.
+
+    Aligned with the interlink-hq/interLink#516 PingResponse schema so the
+    virtual kubelet can call ``updateNodeResources()`` on every heartbeat.
+
+    Args:
+        stdout: String output from ``condor_status --json``.
+
+    Returns:
+        dict with ``status`` and ``resources`` keys (cpu/memory as Kubernetes
+        quantity strings, e.g. ``"24"`` and ``"96000Mi"``).
+
+    Raises:
+        ValueError: If *stdout* cannot be parsed or contains no slots.
+
+    TODO: Replace the locally-defined PingResponse dict with the upstream
+    commonIL.PingResponse type once interlink-hq/interLink#516 is merged and
+    the interLink dependency is updated.
+    """
+    try:
+        slots = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"condor_status --json parse error: {e}") from e
+
+    if not isinstance(slots, list) or len(slots) == 0:
+        raise ValueError("condor_status --json returned no slots")
+
+    avail_cpus = 0
+    avail_mem_mb = 0
+    for slot in slots:
+        # Skip dynamic child-slots to avoid double-counting with partitionable
+        # slot parents which already advertise remaining (unclaimed) capacity.
+        if slot.get("DynamicSlot", False):
+            continue
+        if slot.get("State", "") == "Unclaimed":
+            avail_cpus += slot.get("Cpus", 0)
+            avail_mem_mb += slot.get("Memory", 0)
+
+    return {
+        "status": "ok",
+        "resources": {
+            "cpu": str(avail_cpus),
+            "memory": f"{avail_mem_mb}Mi",
+        },
+    }
+
+
+def parse_cluster_resources_from_text(stdout):
+    """Parse ``condor_status -autoformat Cpus Memory`` output into a PingResponse dict.
+
+    Each non-empty line is expected to contain two whitespace-separated
+    integers: CPUs and memory in MB.  Lines that cannot be parsed are
+    silently skipped.
+
+    NOTE: Unlike :func:`parse_cluster_resources_from_json` which reports
+    *available* resources, this function sums the total installed CPUs and
+    memory because plain-text ``condor_status`` output does not include
+    per-slot allocation state.
+
+    Args:
+        stdout: String output from ``condor_status -autoformat Cpus Memory``.
+
+    Returns:
+        dict with ``status`` and ``resources`` keys (cpu/memory as Kubernetes
+        quantity strings).
+    """
+    total_cpus = 0
+    total_mem_mb = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            cpu = int(parts[0])
+            mem = int(parts[1])
+        except ValueError:
+            continue
+        total_cpus += cpu
+        total_mem_mb += mem
+
+    return {
+        "status": "ok",
+        "resources": {
+            "cpu": str(total_cpus),
+            "memory": f"{total_mem_mb}Mi",
+        },
+    }
+
+
+def get_taints_from_config():
+    """Return the taint list from ``SidecarConfig.yaml``, or ``None`` if not configured.
+
+    When the ``Taints`` key is present in the config (even as an empty list),
+    the returned list is passed to the VK in the ping response so it can
+    replace the node's non-system taints (interLink#516 behaviour).
+    When the key is absent, ``None`` is returned and the ``taints`` field is
+    omitted from the ping response, leaving the node's existing taints intact.
+
+    Each taint dict must have a ``key`` and ``effect`` field (``value`` is
+    optional).  Invalid entries are skipped with a warning.
+
+    Returns:
+        list of taint dicts, or None.
+    """
+    raw = InterLinkConfigInst.get("Taints")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        logging.warning(
+            "SidecarConfig Taints must be a list; ignoring invalid value: %r", raw
+        )
+        return None
+
+    taints = []
+    for item in raw:
+        if not isinstance(item, dict):
+            logging.warning("Skipping non-dict taint entry: %r", item)
+            continue
+        key = item.get("key", "")
+        effect = item.get("effect", "")
+        if not key or not effect:
+            logging.warning(
+                "Skipping taint with missing key or effect: %r", item
+            )
+            continue
+        taint = {"key": key, "effect": effect}
+        if "value" in item:
+            taint["value"] = item["value"]
+        taints.append(taint)
+    return taints
+
+
+def get_cluster_resources():
+    """Query the cluster for current resource availability.
+
+    When ``ClusterResourcesScript`` is set in ``SidecarConfig.yaml``, that
+    command is executed and its stdout is parsed as a JSON PingResponse dict
+    (must contain at least a ``resources`` key).  This lets operators supply
+    their own resource-reporting logic without modifying the plugin code.
+
+    When ``ClusterResourcesScript`` is not set, the built-in HTCondor logic
+    is used: tries ``condor_status --json`` first for accurate per-slot
+    available CPU and memory data, then falls back to
+    ``condor_status -autoformat Cpus Memory`` (total capacity) when JSON
+    output is unavailable or cannot be parsed.
+
+    Returns:
+        dict aligned with the interLink#516 PingResponse schema.
+
+    Raises:
+        OSError: if the configured script cannot be executed.
+        ValueError: if the script output cannot be parsed as JSON.
+    """
+    script = InterLinkConfigInst.get("ClusterResourcesScript", "").strip()
+    if script:
+        return _run_cluster_resources_script(script)
+
+    # Built-in HTCondor path
+    try:
+        process = os.popen("condor_status --json 2>/dev/null")
+        stdout = process.read()
+        process.close()
+        if stdout.strip():
+            return parse_cluster_resources_from_json(stdout)
+    except (OSError, ValueError) as e:
+        logging.debug(
+            f"condor_status --json unavailable ({e}), falling back to text parsing"
+        )
+
+    # Fallback: plain-text condor_status
+    process = os.popen("condor_status -autoformat Cpus Memory 2>/dev/null")
+    stdout = process.read()
+    process.close()
+    return parse_cluster_resources_from_text(stdout)
+
+
+def _run_cluster_resources_script(script):
+    """Execute *script* and parse its JSON stdout as a PingResponse dict.
+
+    The script is responsible for printing a JSON object to stdout that
+    follows the interLink#516 PingResponse schema, e.g.::
+
+        {"status": "ok", "resources": {"cpu": "48", "memory": "192000Mi"}}
+
+    The ``status`` field defaults to ``"ok"`` if the script omits it.
+    Only ``resources`` (and optionally ``taints``) are propagated; any other
+    fields in the script output are silently ignored.
+
+    Args:
+        script: Shell command string to execute (run via the shell so that
+            paths, env vars and pipes work as expected).
+
+    Returns:
+        dict aligned with the interLink#516 PingResponse schema.
+
+    Raises:
+        OSError: if the script cannot be executed.
+        ValueError: if the script output cannot be parsed as a JSON object.
+    """
+    logging.debug(f"Running ClusterResourcesScript: {script}")
+    process = os.popen(f"{script} 2>/dev/null")
+    stdout = process.read()
+    process.close()
+
+    if not stdout.strip():
+        raise ValueError(
+            f"ClusterResourcesScript produced no output: {script!r}"
+        )
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"ClusterResourcesScript output is not valid JSON: {e}"
+        ) from e
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"ClusterResourcesScript output must be a JSON object, got: {type(data).__name__}"
+        )
+
+    result = {"status": data.get("status", "ok")}
+    if "resources" in data:
+        result["resources"] = data["resources"]
+    return result
+
+
 def StatusHandler():
     # READ THE REQUEST #####################
     logging.info("HTCondor Sidecar: received GetStatus call")
     try:
         request_data_string = request.data.decode("utf-8")
         req_list = json.loads(request_data_string)
-        # Handle ping requests (empty array)
+        # Handle ping requests (empty array): return cluster resource availability
+        # as JSON so the virtual kubelet can update the node's advertised capacity.
+        # This path is triggered by the interlink-api ping call (interLink#516).
         if isinstance(req_list, list) and len(req_list) == 0:
-            logging.info("Received ping request")
-            if args.proxy and os.path.isfile(args.proxy):
-                return success_response(
-                    {"message": "HTCondor sidecar is alive", "status": "healthy"}, 200
-                )
-            else:
+            logging.info(
+                "Received ping request (empty pod list), returning cluster resource availability"
+            )
+            if args.proxy and not os.path.isfile(args.proxy):
                 return error_response(
                     "HTCondor sidecar not ready - proxy file not available", 503
                 )
+            try:
+                ping_resp = get_cluster_resources()
+            except (OSError, ValueError) as e:
+                logging.warning(f"Failed to query cluster resources: {e}")
+                ping_resp = {"status": "ok"}
+            # Add taints from config if configured (interLink#516).
+            # When present (even as []), the VK replaces non-system taints.
+            # When absent, the VK leaves existing taints unchanged.
+            taints = get_taints_from_config()
+            if taints is not None:
+                ping_resp["taints"] = taints
+            return jsonify(ping_resp), 200
         # Validate request format
         if not isinstance(req_list, list):
             return error_response("Status request must be an array", 400)
