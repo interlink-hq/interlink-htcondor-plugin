@@ -201,9 +201,13 @@ for i in $(seq 1 30); do
 done
 
 if [ "${condor_ready}" -ne 1 ]; then
-  echo "WARNING: condor_status not responding after 150 s; continuing anyway"
-  docker logs htcondor-sidecar --tail=30 || true
+  echo "ERROR: condor_status not responding after 150 s — HTCondor failed to start"
+  echo ""
+  echo "=== htcondor-sidecar container logs ==="
+  docker logs htcondor-sidecar 2>&1 || true
+  exit 1
 fi
+echo "✓ HTCondor daemons are ready"
 
 # Wait for the plugin Flask server to respond on port 8000
 echo "Waiting for plugin HTTP server to respond..."
@@ -220,8 +224,11 @@ for i in $(seq 1 20); do
 done
 
 if [ "${plugin_ready}" -ne 1 ]; then
-  echo "WARNING: plugin HTTP server did not respond in time; continuing anyway"
-  docker logs htcondor-sidecar --tail=30 || true
+  echo "ERROR: plugin HTTP server did not respond in time"
+  echo ""
+  echo "=== htcondor-sidecar container logs ==="
+  docker logs htcondor-sidecar 2>&1 || true
+  exit 1
 fi
 echo "✓ Plugin HTTP server is ready"
 
