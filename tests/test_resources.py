@@ -13,6 +13,8 @@ import os
 import sys
 import unittest.mock as mock
 
+import pytest
+
 
 def _make_handles_module():
     """Import handles with mocked globals so top-level parse code doesn't fail."""
@@ -91,12 +93,10 @@ class TestParseClusterResourcesFromJSON:
         assert resp["resources"]["memory"] == "0Mi"
 
     def test_invalid_json_raises_value_error(self):
-        import pytest
         with pytest.raises(ValueError, match="parse error"):
             handles.parse_cluster_resources_from_json("not valid json")
 
     def test_empty_list_raises_value_error(self):
-        import pytest
         with pytest.raises(ValueError, match="no slots"):
             handles.parse_cluster_resources_from_json("[]")
 
@@ -289,8 +289,198 @@ class TestPingPathIntegration:
 
 
 # ---------------------------------------------------------------------------
-# get_taints_from_config
+# ClusterResourcesScript config key
 # ---------------------------------------------------------------------------
+
+
+class TestClusterResourcesScript:
+    """Tests for the ClusterResourcesScript config path in get_cluster_resources()."""
+
+    @staticmethod
+    def _make_script_popen(output_by_cmd):
+        """Return a fake os.popen keyed on command string prefix."""
+
+        def fake_popen(cmd):
+            for prefix, out in output_by_cmd.items():
+                if prefix in cmd:
+                    class FakeProc:
+                        def read(self):
+                            return out
+
+                        def close(self):
+                            pass
+
+                    return FakeProc()
+
+            class EmptyProc:
+                def read(self):
+                    return ""
+
+                def close(self):
+                    pass
+
+            return EmptyProc()
+
+        return fake_popen
+
+    def test_custom_script_used_when_configured(self, monkeypatch):
+        """When ClusterResourcesScript is set it must be called instead of condor_status."""
+        script_output = _json.dumps(
+            {"status": "ok", "resources": {"cpu": "99", "memory": "999Mi"}}
+        )
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": script_output}),
+        )
+        result = handles.get_cluster_resources()
+        assert result["resources"]["cpu"] == "99"
+        assert result["resources"]["memory"] == "999Mi"
+        assert result["status"] == "ok"
+
+    def test_custom_script_output_in_ping_response(self, monkeypatch):
+        """Custom script resources must appear in the /status ping response."""
+        script_output = _json.dumps(
+            {"status": "ok", "resources": {"cpu": "32", "memory": "64000Mi"}}
+        )
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": script_output}),
+        )
+        monkeypatch.setattr(handles, "args", mock.MagicMock(proxy=""))
+        resp = _flask_test_client().get(
+            "/status", data=_json.dumps([]), content_type="application/json"
+        )
+        assert resp.status_code == 200
+        data = _json.loads(resp.data)
+        assert data["resources"]["cpu"] == "32"
+        assert data["resources"]["memory"] == "64000Mi"
+
+    def test_custom_script_no_resources_key(self, monkeypatch):
+        """Script output without 'resources' key returns a status-only response."""
+        script_output = _json.dumps({"status": "ok"})
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": script_output}),
+        )
+        result = handles.get_cluster_resources()
+        assert result["status"] == "ok"
+        assert "resources" not in result
+
+    def test_custom_script_empty_output_raises(self, monkeypatch):
+        """Empty script output must raise ValueError."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": ""}),
+        )
+        with pytest.raises(ValueError, match="no output"):
+            handles.get_cluster_resources()
+
+    def test_custom_script_invalid_json_raises(self, monkeypatch):
+        """Non-JSON script output must raise ValueError."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": "not json"}),
+        )
+        with pytest.raises(ValueError, match="not valid JSON"):
+            handles.get_cluster_resources()
+
+    def test_custom_script_non_object_json_raises(self, monkeypatch):
+        """Script output that is a JSON array instead of object must raise ValueError."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": "[1,2,3]"}),
+        )
+        with pytest.raises(ValueError, match="JSON object"):
+            handles.get_cluster_resources()
+
+    def test_no_custom_script_uses_condor_status(self, monkeypatch):
+        """When ClusterResourcesScript is absent, condor_status must be used."""
+        slots = [{"Cpus": 8, "Memory": 16384, "State": "Unclaimed"}]
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {},  # no ClusterResourcesScript
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"condor_status --json": _json.dumps(slots)}),
+        )
+        result = handles.get_cluster_resources()
+        assert result["resources"]["cpu"] == "8"
+
+    def test_empty_script_string_uses_condor_status(self, monkeypatch):
+        """An empty ClusterResourcesScript string must fall through to condor_status."""
+        slots = [{"Cpus": 4, "Memory": 8192, "State": "Unclaimed"}]
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": ""},
+        )
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"condor_status --json": _json.dumps(slots)}),
+        )
+        result = handles.get_cluster_resources()
+        assert result["resources"]["cpu"] == "4"
+
+    def test_custom_script_ping_falls_back_to_ok_on_error(self, monkeypatch):
+        """When the configured script fails, ping should still return 200 with status=ok."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"ClusterResourcesScript": "/custom/resources.sh"},
+        )
+        # Script returns empty output → ValueError in get_cluster_resources
+        monkeypatch.setattr(
+            os,
+            "popen",
+            self._make_script_popen({"/custom/resources.sh": ""}),
+        )
+        monkeypatch.setattr(handles, "args", mock.MagicMock(proxy=""))
+        resp = _flask_test_client().get(
+            "/status", data=_json.dumps([]), content_type="application/json"
+        )
+        assert resp.status_code == 200
+        data = _json.loads(resp.data)
+        assert data["status"] == "ok"
 
 
 class TestGetTaintsFromConfig:

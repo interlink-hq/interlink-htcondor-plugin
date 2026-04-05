@@ -1,6 +1,15 @@
 CommandPrefix: ""
 ExportPodData: true
 DataRootFolder: ".knoc/"
+# ClusterResourcesScript is an optional shell command that, when set, is executed
+# on every ping call instead of the built-in condor_status logic to report the
+# cluster's available resources.  The command must print a JSON object to stdout
+# that follows the interLink#516 PingResponse schema, e.g.:
+#   {"status": "ok", "resources": {"cpu": "48", "memory": "192000Mi"}}
+# This allows operators to supply custom resource-reporting logic without
+# modifying the plugin code.
+# Example:
+# ClusterResourcesScript: "/usr/local/bin/my-resource-reporter.sh"
 # Taints is an optional list of Kubernetes taints to advertise on the virtual node
 # via the ping response (interLink#516).  When present (even as an empty list),
 # the VK replaces all non-system taints with this list; when absent, existing taints

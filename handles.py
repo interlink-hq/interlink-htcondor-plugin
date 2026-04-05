@@ -1125,16 +1125,31 @@ def get_taints_from_config():
 
 
 def get_cluster_resources():
-    """Query HTCondor for current cluster resource availability.
+    """Query the cluster for current resource availability.
 
-    Tries ``condor_status --json`` first for accurate per-slot available
-    CPU and memory data.  Falls back to
+    When ``ClusterResourcesScript`` is set in ``SidecarConfig.yaml``, that
+    command is executed and its stdout is parsed as a JSON PingResponse dict
+    (must contain at least a ``resources`` key).  This lets operators supply
+    their own resource-reporting logic without modifying the plugin code.
+
+    When ``ClusterResourcesScript`` is not set, the built-in HTCondor logic
+    is used: tries ``condor_status --json`` first for accurate per-slot
+    available CPU and memory data, then falls back to
     ``condor_status -autoformat Cpus Memory`` (total capacity) when JSON
     output is unavailable or cannot be parsed.
 
     Returns:
         dict aligned with the interLink#516 PingResponse schema.
+
+    Raises:
+        OSError: if the configured script cannot be executed.
+        ValueError: if the script output cannot be parsed as JSON.
     """
+    script = InterLinkConfigInst.get("ClusterResourcesScript", "").strip()
+    if script:
+        return _run_cluster_resources_script(script)
+
+    # Built-in HTCondor path
     try:
         process = os.popen("condor_status --json 2>/dev/null")
         stdout = process.read()
@@ -1151,6 +1166,57 @@ def get_cluster_resources():
     stdout = process.read()
     process.close()
     return parse_cluster_resources_from_text(stdout)
+
+
+def _run_cluster_resources_script(script):
+    """Execute *script* and parse its JSON stdout as a PingResponse dict.
+
+    The script is responsible for printing a JSON object to stdout that
+    follows the interLink#516 PingResponse schema, e.g.::
+
+        {"status": "ok", "resources": {"cpu": "48", "memory": "192000Mi"}}
+
+    The ``status`` field defaults to ``"ok"`` if the script omits it.
+    Only ``resources`` (and optionally ``taints``) are propagated; any other
+    fields in the script output are silently ignored.
+
+    Args:
+        script: Shell command string to execute (run via the shell so that
+            paths, env vars and pipes work as expected).
+
+    Returns:
+        dict aligned with the interLink#516 PingResponse schema.
+
+    Raises:
+        OSError: if the script cannot be executed.
+        ValueError: if the script output cannot be parsed as a JSON object.
+    """
+    logging.debug(f"Running ClusterResourcesScript: {script}")
+    process = os.popen(f"{script} 2>/dev/null")
+    stdout = process.read()
+    process.close()
+
+    if not stdout.strip():
+        raise ValueError(
+            f"ClusterResourcesScript produced no output: {script!r}"
+        )
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"ClusterResourcesScript output is not valid JSON: {e}"
+        ) from e
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"ClusterResourcesScript output must be a JSON object, got: {type(data).__name__}"
+        )
+
+    result = {"status": data.get("status", "ok")}
+    if "resources" in data:
+        result["resources"] = data["resources"]
+    return result
 
 
 def StatusHandler():
@@ -1172,8 +1238,8 @@ def StatusHandler():
                 )
             try:
                 ping_resp = get_cluster_resources()
-            except OSError as e:
-                logging.warning(f"Failed to query HTCondor cluster resources: {e}")
+            except (OSError, ValueError) as e:
+                logging.warning(f"Failed to query cluster resources: {e}")
                 ping_resp = {"status": "ok"}
             # Add taints from config if configured (interLink#516).
             # When present (even as []), the VK replaces non-system taints.
