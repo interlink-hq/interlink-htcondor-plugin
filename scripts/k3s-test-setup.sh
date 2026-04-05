@@ -84,6 +84,15 @@ echo "✓ K3s is ready"
 kubectl get nodes
 
 # ---------------------------------------------------------------------------
+# Initialise the vk-test-set submodule
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Initialising vk-test-set submodule ==="
+cd "${PROJECT_ROOT}"
+git submodule update --init test/vk-test-set
+echo "✓ vk-test-set submodule initialised"
+
+# ---------------------------------------------------------------------------
 # Build htcondor-sidecar Docker image
 # ---------------------------------------------------------------------------
 echo ""

@@ -1,8 +1,10 @@
 #!/bin/bash
-# k3s-test-run.sh — Run the HTCondor plugin e2e tests against the live K3s cluster.
+# k3s-test-run.sh — Run the vk-test-set pytest suite against the live K3s cluster.
 #
 # Usage: bash scripts/k3s-test-run.sh
 #
+# This uses the interlink-hq/vk-test-set pytest suite (test/vk-test-set submodule),
+# matching the approach in interlink-hq/interLink#514.
 # Expects k3s-test-setup.sh to have run successfully first.
 # Reads TEST_DIR from /tmp/interlink-test-dir.txt.
 
@@ -72,85 +74,77 @@ echo "✓ virtual-kubelet node is Ready"
 kubectl get csr -o name | xargs -r kubectl certificate approve 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Apply test pod
+# Initialise the vk-test-set submodule (in case checkout didn't do it)
 # ---------------------------------------------------------------------------
-echo ""
-echo "=== Applying e2e test pod ==="
-
-# Clean up any previous run
-kubectl delete pod interlink-htcondor-test --ignore-not-found=true --wait=false
-
-kubectl apply -f "${PROJECT_ROOT}/tests/e2e_test_pod.yaml"
-echo "✓ Test pod submitted"
-
-# ---------------------------------------------------------------------------
-# Wait for test pod to complete
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Waiting for test pod to complete ==="
-POD_TIMEOUT="${POD_TIMEOUT:-600}"
-
-echo "Waiting up to ${POD_TIMEOUT}s for the test pod to finish..."
-pod_done=0
-elapsed=0
-while [ "${elapsed}" -lt "${POD_TIMEOUT}" ]; do
-  PHASE=$(kubectl get pod interlink-htcondor-test \
-    -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-
-  case "${PHASE}" in
-    Succeeded)
-      echo "✓ Pod completed successfully (phase: ${PHASE})"
-      pod_done=1
-      break
-      ;;
-    Failed)
-      echo "ERROR: Pod failed (phase: ${PHASE})"
-      kubectl describe pod interlink-htcondor-test || true
-      pod_done=2
-      break
-      ;;
-    *)
-      echo "  Pod phase: ${PHASE} (${elapsed}s / ${POD_TIMEOUT}s elapsed)"
-      sleep 10
-      elapsed=$((elapsed + 10))
-      ;;
-  esac
-done
-
-# ---------------------------------------------------------------------------
-# Collect diagnostics
-# ---------------------------------------------------------------------------
-echo ""
-echo "=== Pod status ==="
-kubectl get pod interlink-htcondor-test -o wide || true
-kubectl describe pod interlink-htcondor-test 2>/dev/null \
-  | tee "${TEST_DIR}/pod-describe.txt" || true
-
-echo ""
-echo "=== Logs ==="
-kubectl logs interlink-htcondor-test 2>/dev/null \
-  | tee "${TEST_DIR}/pod-logs.txt" || true
-
-echo ""
-echo "=== interLink API logs (last 50 lines) ==="
-tail -50 "${TEST_DIR}/interlink-api.log" 2>/dev/null || true
-
-echo ""
-echo "=== htcondor-sidecar container logs (last 50 lines) ==="
-docker logs htcondor-sidecar --tail=50 2>/dev/null || true
-
-# ---------------------------------------------------------------------------
-# Result
-# ---------------------------------------------------------------------------
-echo ""
-if [ "${pod_done}" -eq 1 ]; then
-  echo "✓ e2e test PASSED"
-  exit 0
-elif [ "${pod_done}" -eq 2 ]; then
-  echo "✗ e2e test FAILED — pod entered Failed phase"
-  exit 1
-else
-  echo "✗ e2e test TIMED OUT — pod did not complete within ${POD_TIMEOUT}s"
-  kubectl get pod interlink-htcondor-test || true
-  exit 1
+if [ ! -f "${PROJECT_ROOT}/test/vk-test-set/setup.py" ]; then
+  echo "Initialising test/vk-test-set submodule..."
+  cd "${PROJECT_ROOT}"
+  git submodule update --init test/vk-test-set
 fi
+
+cd "${PROJECT_ROOT}/test/vk-test-set"
+
+# ---------------------------------------------------------------------------
+# Write vktest_config.yaml (HTCondor-specific)
+# ---------------------------------------------------------------------------
+echo "Creating test configuration..."
+cat > vktest_config.yaml <<EOF
+target_nodes:
+  - virtual-kubelet
+
+required_namespaces:
+  - default
+  - kube-system
+
+timeout_multiplier: 10.
+values:
+  namespace: default
+
+  annotations: {}
+
+  tolerations:
+    - key: virtual-node.interlink/no-schedule
+      operator: Exists
+      effect: NoSchedule
+EOF
+
+# ---------------------------------------------------------------------------
+# Set up Python venv and install vk-test-set
+# ---------------------------------------------------------------------------
+echo "Setting up Python environment..."
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install -e ./ || {
+  echo "ERROR: Failed to install vk-test-set"
+  exit 1
+}
+echo "✓ vk-test-set installed"
+
+# ---------------------------------------------------------------------------
+# Run pytest
+# ---------------------------------------------------------------------------
+echo ""
+echo "Running integration tests..."
+echo "========================================="
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+pytest -v -k "not rclone and not limits and not stress and not multi-init and not fail" \
+  2>&1 | tee "${TEST_DIR}/test-results.log"
+TEST_EXIT_CODE=${PIPESTATUS[0]}
+
+echo "========================================="
+echo ""
+
+if [ "${TEST_EXIT_CODE}" -eq 0 ]; then
+  echo "✓ All tests passed!"
+else
+  echo "✗ Some tests failed (exit code: ${TEST_EXIT_CODE})"
+  echo ""
+  echo "Check logs for details:"
+  echo "  - Test results:   ${TEST_DIR}/test-results.log"
+  echo "  - VK:             ${TEST_DIR}/vk.log"
+  echo "  - interLink API:  ${TEST_DIR}/interlink-api.log"
+  echo "  - Sidecar:        ${TEST_DIR}/htcondor-sidecar.log"
+fi
+
+exit "${TEST_EXIT_CODE}"
