@@ -8,5 +8,7 @@ DataRootFolder: ".knoc/"
 # Example:
 # Taints:
 #   - key: "example.com/no-schedule"
-#     value: ""
+#     effect: "NoSchedule"
+#   - key: "example.com/gpu"
+#     value: "true"
 #     effect: "NoSchedule"

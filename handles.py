@@ -1118,7 +1118,7 @@ def get_taints_from_config():
             )
             continue
         taint = {"key": key, "effect": effect}
-        if item.get("value"):
+        if "value" in item:
             taint["value"] = item["value"]
         taints.append(taint)
     return taints

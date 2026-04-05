@@ -353,6 +353,22 @@ class TestGetTaintsFromConfig:
         assert len(result) == 1
         assert result[0]["value"] == "true"
 
+    def test_taint_with_empty_string_value(self, monkeypatch):
+        """An explicitly set empty-string value must be preserved (not silently dropped)."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {
+                "Taints": [
+                    {"key": "example.com/no-schedule", "value": "", "effect": "NoSchedule"}
+                ]
+            },
+        )
+        result = handles.get_taints_from_config()
+        assert len(result) == 1
+        assert "value" in result[0]
+        assert result[0]["value"] == ""
+
     def test_multiple_taints(self, monkeypatch):
         monkeypatch.setattr(
             handles,
