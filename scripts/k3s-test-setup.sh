@@ -167,7 +167,7 @@ EOF
 # Virtual Kubelet config
 POD_IP=$(hostname -I | awk '{print $1}')
 cat > "${TEST_DIR}/vk-config.yaml" <<EOF
-InterlinkURL: "http://localhost"
+InterlinkURL: "http://${POD_IP}"
 InterlinkPort: "3000"
 VerboseLogging: true
 ErrorsOnlyLogging: false
