@@ -344,9 +344,7 @@ def mount_empty_dir(container, pod):
                 )
                 cmd = ["-p", ed_path]
                 subprocess.run(["mkdir"] + cmd, check=True)
-                ed_path += (
-                    ":" + mount_spec["mountPath"] + "/" + mount_spec["name"] + ","
-                )
+                ed_path += ":" + mount_spec["mountPath"] + "/" + mount_spec["name"]
 
     return ed_path
 
@@ -904,6 +902,8 @@ def SubmitHandler():
                     seen_input_files.add(env_path)
             local_mounts = ["--bind", ""]
             for mount in (mounts[-1].split(","))[:-1]:
+                if not mount or ":" not in mount:
+                    continue
                 if "/cvmfs" not in mount:
                     prefix_ = "./"
                 else:
