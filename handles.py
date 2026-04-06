@@ -130,17 +130,50 @@ def prepare_envs(container):
         return [""]
 
 
-def prepare_env_file(container, metadata, env_file_name="jlab.env"):
+def prepare_env_file(container, metadata, container_standalone=None):
+    """Write an env file for the given container and return (flags, path).
+
+    Singularity's ``--env-file`` reads each line as ``KEY=VALUE`` where the
+    value is taken *literally* (no shell expansion).  We must NOT shell-quote
+    the values here — ``shlex.quote`` would add single-quotes that become part
+    of the literal value seen by the container.
+
+    ``envFrom`` entries (secretRef / configMapRef) are expanded from the
+    ``container_standalone`` data supplied by the interLink sidecar so that all
+    keys from the referenced Secrets / ConfigMaps are also injected.
+    """
     env_file_name = f"{metadata['name']}-{metadata['uid']}_env.env"
     env_file_path = os.path.join(InterLinkConfigInst["DataRootFolder"], env_file_name)
     lines = []
 
     try:
+        # --- individual env vars (already resolved by interLink) -------------
         for env_var in container.get("env", []):
             name = env_var["name"]
             raw_val = env_var.get("value") or ""
-            safe_val = shlex.quote(raw_val)
+            # Replace embedded newlines so as not to break the line-based format
+            safe_val = raw_val.replace("\n", "\\n")
             lines.append(f"{name}={safe_val}")
+
+        # --- envFrom (bulk import from Secret or ConfigMap) ------------------
+        if container_standalone is not None:
+            secrets_list = container_standalone.get("secrets", [])
+            configmaps_list = container_standalone.get("configMaps", [])
+            for env_from in container.get("envFrom", []):
+                if "secretRef" in env_from:
+                    ref_name = env_from["secretRef"].get("name", "")
+                    for secret in secrets_list:
+                        if secret.get("metadata", {}).get("name") == ref_name:
+                            for k, v in secret.get("data", {}).items():
+                                safe_v = (v or "").replace("\n", "\\n")
+                                lines.append(f"{k}={safe_v}")
+                elif "configMapRef" in env_from:
+                    ref_name = env_from["configMapRef"].get("name", "")
+                    for cm in configmaps_list:
+                        if cm.get("metadata", {}).get("name") == ref_name:
+                            for k, v in cm.get("data", {}).items():
+                                safe_v = (v or "").replace("\n", "\\n")
+                                lines.append(f"{k}={safe_v}")
 
         with open(env_file_path, "w") as fp:
             fp.write("\n".join(lines) + "\n")
@@ -344,7 +377,7 @@ def mount_empty_dir(container, pod):
                 )
                 cmd = ["-p", ed_path]
                 subprocess.run(["mkdir"] + cmd, check=True)
-                ed_path += ":" + mount_spec["mountPath"] + "/" + mount_spec["name"]
+                ed_path += ":" + mount_spec["mountPath"]
 
     return ed_path
 
@@ -508,14 +541,15 @@ endScript() {
 def _clean_command_tokens(tokens):
     """Join and clean a list of singularity command tokens into a single string.
 
-    Wraps the token that follows a ``-c`` flag in single quotes (so the shell
-    does not re-split it), then strips empty double-quoted tokens and collapses
-    extra whitespace.
+    Wraps the token that follows a ``-c`` flag with ``shlex.quote`` (so the
+    shell does not re-split multi-line scripts, and single-quotes within the
+    script content are safely escaped), then strips empty double-quoted tokens
+    and collapses extra whitespace.
     """
     result = list(tokens)
     for i in range(1, len(result)):
         if result[i - 1] == "-c":
-            result[i] = "'" + result[i] + "'"
+            result[i] = shlex.quote(result[i])
     line = " ".join(result)
     line = re.sub(r'\s*""\s*', " ", line)
     line = re.sub(r" {2,}", " ", line)
@@ -529,12 +563,17 @@ def produce_htcondor_singularity_script(
     input_files,
     probe_scripts=None,
     cleanup_scripts=None,
+    init_container_commands=None,
 ):
     """Write the HTCondor job executable and submit description file.
 
     Each container is launched in the background via a ``runCtn()`` bash
     helper, mirroring the SLURM plugin's pattern.  ``waitCtns()`` collects
     all exit codes, and ``endScript()`` exits with the highest one.
+
+    Init containers (``init_container_commands``) are run sequentially and to
+    completion *before* the main containers start, matching Kubernetes
+    semantics.  If any init container exits non-zero the job aborts.
 
     Parameters
     ----------
@@ -555,11 +594,17 @@ def produce_htcondor_singularity_script(
     cleanup_scripts:
         Cleanup trap snippets produced by prepare_probes(), matching
         probe_scripts.  Pass None (default) for no probes.
+    init_container_commands:
+        List of ``(container_name, [cmd_tokens])`` tuples for init containers.
+        These run sequentially before the main containers.  Pass None (default)
+        for no init containers.
     """
     if probe_scripts is None:
         probe_scripts = []
     if cleanup_scripts is None:
         cleanup_scripts = []
+    if init_container_commands is None:
+        init_container_commands = []
 
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
@@ -637,6 +682,28 @@ def produce_htcondor_singularity_script(
             # ---- probe background sub-shells ----------------------------
             for ps in probe_scripts:
                 script_body += "\n" + ps + "\n"
+
+            # ---- init containers: run sequentially to completion ---------
+            if init_container_commands:
+                script_body += (
+                    "\n# Init containers (run sequentially before main containers)\n"
+                )
+                for ctn_name, cmd_tokens in init_container_commands:
+                    cleaned = _clean_command_tokens(cmd_tokens)
+                    out_file = (
+                        f'"${{_IL_OUTPUT_DIR}}/${{_IL_POD_NAME}}'
+                        f'-${{_IL_POD_UID}}-{ctn_name}.out"'
+                    )
+                    script_body += f"{cleaned} > {out_file} 2>&1\n"
+                    fail_msg = f"Init container {ctn_name} failed with exit code"
+                    script_body += (
+                        "_init_rc=$?\n"
+                        'if [ "$_init_rc" -ne 0 ]; then\n'
+                        f'  printf "%s %s\\n" "{fail_msg}" "$_init_rc"\n'
+                        '  exit "$_init_rc"\n'
+                        "fi\n"
+                    )
+                script_body += "\n"
 
             # ---- main: run every container in background ----------------
             script_body += "\nhighestExitCode=0\n"
@@ -880,6 +947,7 @@ def SubmitHandler():
     # print("Requested pod metadata name is: ", pod["metadata"]["name"])
     metadata = pod.get("metadata", {})
     containers = pod.get("spec", {}).get("containers", [])
+    init_containers = pod.get("spec", {}).get("initContainers", [])
 
     # NORMAL CASE
     if "host" not in containers[0]["image"]:
@@ -888,19 +956,110 @@ def SubmitHandler():
         # container_commands collects (name, [tokens]) tuples for every container,
         # mirroring the SLURM plugin's runCtn pattern.
         container_commands = []
+        init_container_commands = []
         # all_input_files is accumulated across all containers (deduped via seen set)
         all_input_files = []
         seen_input_files = set()
+
+        # ---- init containers (run before main containers) -------------------
+        for container in init_containers:
+            logging.info(f"Building init-container command for {container['name']}")
+            commstr1 = ["singularity", "exec"]
+            image = ""
+            mounts = [""]
+            container_standalone = None
+            singularity_options = metadata.get("annotations", {}).get(
+                "slurm-job.vk.io/singularity-options", ""
+            )
+            pre_exec = metadata.get("annotations", {}).get(
+                "slurm-job.vk.io/pre-exec", ""
+            )
+            if containers_standalone is not None:
+                for c in containers_standalone:
+                    if c["name"] == container["name"]:
+                        container_standalone = c
+                        mounts = prepare_mounts(pod, container_standalone)
+                        break
+            env_flags, env_path = prepare_env_file(
+                container, metadata, container_standalone
+            )
+            if container["image"].startswith("/cvmfs") or container["image"].startswith(
+                "docker://"
+            ):
+                image = container["image"]
+            else:
+                image = "docker://" + container["image"]
+            for mount in mounts[-1].split(","):
+                if "/cvmfs" not in mount:
+                    mount_src = mount.split(":")[0]
+                    if mount_src and mount_src not in seen_input_files:
+                        all_input_files.append(mount_src)
+                        seen_input_files.add(mount_src)
+                if env_path and env_path not in seen_input_files:
+                    all_input_files.append(env_path)
+                    seen_input_files.add(env_path)
+            local_mounts = ["--bind", ""]
+            for mount in (mounts[-1].split(","))[:-1]:
+                if not mount or ":" not in mount:
+                    continue
+                if "/cvmfs" not in mount:
+                    prefix_ = "./"
+                else:
+                    prefix_ = "/"
+                local_mounts[1] += (
+                    prefix_
+                    + (mount.split(":")[0]).split("/")[-1]
+                    + ":"
+                    + mount.split(":")[1]
+                    + ","
+                )
+            if local_mounts[-1] == "":
+                local_mounts = [""]
+            if "command" in container and "args" in container:
+                singularity_command = (
+                    [pre_exec]
+                    + commstr1
+                    + [singularity_options]
+                    + env_flags
+                    + local_mounts
+                    + [image]
+                    + container["command"]
+                    + container["args"]
+                )
+            elif "command" in container:
+                singularity_command = (
+                    [pre_exec]
+                    + commstr1
+                    + [singularity_options]
+                    + env_flags
+                    + local_mounts
+                    + [image]
+                    + container["command"]
+                )
+            elif "args" in container:
+                singularity_command = (
+                    [pre_exec]
+                    + commstr1
+                    + [singularity_options]
+                    + env_flags
+                    + local_mounts
+                    + [image]
+                    + container["args"]
+                )
+            else:
+                singularity_command = (
+                    [pre_exec] + commstr1 + env_flags + local_mounts + [image]
+                )
+            init_container_commands.append((container["name"], singularity_command))
 
         for container in containers:
             logging.info(
                 f"Beginning script generation for container {container['name']}"
             )
             commstr1 = ["singularity", "exec"]
-            # envs = prepare_envs(container)
-            env_flags, env_path = prepare_env_file(container, metadata)
             image = ""
             mounts = [""]
+            container_standalone = None
             singularity_options = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/singularity-options", ""
             )
@@ -916,8 +1075,11 @@ def SubmitHandler():
                     if c["name"] == container["name"]:
                         container_standalone = c
                         mounts = prepare_mounts(pod, container_standalone)
-            else:
-                mounts = [""]
+                        break
+            # envs = prepare_envs(container)
+            env_flags, env_path = prepare_env_file(
+                container, metadata, container_standalone
+            )
             # if container["image"].startswith("/") or ".io" in container["image"]:
             # if container["image"].startswith("/") or "://" in container["image"]:
             #    image_uri = metadata.get("Annotations", {}).get(
@@ -1014,6 +1176,7 @@ def SubmitHandler():
             all_input_files,
             probe_scripts=probe_scripts,
             cleanup_scripts=cleanup_scripts,
+            init_container_commands=init_container_commands,
         )
 
     else:
