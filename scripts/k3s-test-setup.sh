@@ -192,16 +192,20 @@ echo "✓ Config files generated"
 echo "Waiting for HTCondor daemons to initialise..."
 condor_ready=0
 for i in $(seq 1 30); do
-  if docker exec htcondor-sidecar condor_status -totals >/dev/null 2>&1; then
+  if docker exec htcondor-sidecar condor_status 2>/dev/null | grep -q "slot"; then
     condor_ready=1
     break
   fi
   echo "  Waiting for condor_status... ($i/30)"
+  docker exec htcondor-sidecar condor_status 2>&1 || true
   sleep 5
 done
 
 if [ "${condor_ready}" -ne 1 ]; then
   echo "ERROR: condor_status not responding after 150 s — HTCondor failed to start"
+  echo ""
+  echo "=== condor_status -debug output ==="
+  docker exec htcondor-sidecar condor_status -debug 2>&1 || true
   echo ""
   echo "=== htcondor-sidecar container stdout/stderr ==="
   docker logs htcondor-sidecar 2>&1 || true
