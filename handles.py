@@ -466,14 +466,15 @@ def _is_main_command_line(stripped):
 # These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
 # each Singularity container runs in the background and all exit codes are
 # collected before the job terminates.
-# _IL_POD_NAME and _IL_POD_UID are injected into each generated script so
-# that per-container output files are named uniquely and can be retrieved by
-# LogsHandler after HTCondor transfers them back on job completion.
+# _IL_POD_NAME, _IL_POD_UID, and _IL_OUTPUT_DIR are injected into each
+# generated script so that per-container output files are written directly
+# to the data-root directory (accessible by the condor user because it is
+# chmod 1777) and can be retrieved by LogsHandler for kubectl-logs requests.
 _RUN_CTN_HELPERS = r"""
 runCtn() {
   local ctn="$1"
   shift
-  ( "$@" ) > "${workingPath}/${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
+  ( "$@" ) > "${_IL_OUTPUT_DIR}/${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
   local pid="$!"
   printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
   pidCtns="${pidCtns} ${pid}:${ctn}"
@@ -613,11 +614,14 @@ def produce_htcondor_singularity_script(
 
         with open(executable_path, "w") as f:
             # ---- shebang + pod-specific variables -----------------------
-            # _IL_POD_NAME / _IL_POD_UID are used by runCtn() to build a
-            # unique per-container output filename inside the scratch dir.
+            # _IL_POD_NAME / _IL_POD_UID / _IL_OUTPUT_DIR are used by
+            # runCtn() to write per-container output directly to the
+            # data-root directory (chmod 1777) so no HTCondor file
+            # transfer is needed.
             script_body = "#!/bin/bash\n"
             script_body += f"export _IL_POD_NAME={shlex.quote(name)}\n"
             script_body += f"export _IL_POD_UID={shlex.quote(uid)}\n"
+            script_body += f"export _IL_OUTPUT_DIR={shlex.quote(abs_dataroot)}\n"
 
             # ---- probe cleanup traps (must be defined before any trap) --
             for cs in cleanup_scripts:
@@ -655,11 +659,6 @@ def produce_htcondor_singularity_script(
             os.makedirs(subdir_path, exist_ok=True)
             os.chmod(subdir_path, 0o1777)
 
-        # Per-container output files that HTCondor will transfer from the
-        # scratch directory back to the data root when the job finishes.
-        output_files = [
-            f"{name}-{uid}-{ctn_name}.out" for ctn_name, _ in container_commands
-        ]
         transfer_input_line = (
             f"transfer_input_files = {','.join(input_files)}" if input_files else ""
         )
@@ -671,8 +670,7 @@ Output     = {abs_dataroot}/out/mm_mul.out.$(Cluster).$(Process)
 Error      = {abs_dataroot}/err/mm_mul.err.$(Cluster).$(Process)
 
 {transfer_input_line}
-transfer_output_files = {",".join(output_files)}
-output_destination = {abs_dataroot}/
+transfer_output_files = ""
 should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
