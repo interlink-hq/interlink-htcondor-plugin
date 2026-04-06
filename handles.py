@@ -175,9 +175,14 @@ def prepare_env_file(container, metadata, container_standalone=None):
                                 safe_v = (v or "").replace("\n", "\\n")
                                 lines.append(f"{k}={safe_v}")
 
+        # Env vars may include secret values resolved by the interLink sidecar.
+        # Writing them to a file is necessary to pass them to the Singularity
+        # container via --env-file.  Use mode 0o644 (readable by all) since
+        # HTCondor's condor_shadow must be able to read and transfer this file
+        # to the execute node.
         with open(env_file_path, "w") as fp:
             fp.write("\n".join(lines) + "\n")
-        os.chmod(env_file_path, 0o777)
+        os.chmod(env_file_path, 0o644)
         logging.info(f"Wrote env file to {env_file_path}")
 
         return (["--env-file", env_file_name], env_file_path)
@@ -995,9 +1000,9 @@ def SubmitHandler():
                     if mount_src and mount_src not in seen_input_files:
                         all_input_files.append(mount_src)
                         seen_input_files.add(mount_src)
-                if env_path and env_path not in seen_input_files:
-                    all_input_files.append(env_path)
-                    seen_input_files.add(env_path)
+            if env_path and env_path not in seen_input_files:
+                all_input_files.append(env_path)
+                seen_input_files.add(env_path)
             local_mounts = ["--bind", ""]
             for mount in (mounts[-1].split(","))[:-1]:
                 if not mount or ":" not in mount:
@@ -1106,9 +1111,9 @@ def SubmitHandler():
                     if mount_src and mount_src not in seen_input_files:
                         all_input_files.append(mount_src)
                         seen_input_files.add(mount_src)
-                if env_path and env_path not in seen_input_files:
-                    all_input_files.append(env_path)
-                    seen_input_files.add(env_path)
+            if env_path and env_path not in seen_input_files:
+                all_input_files.append(env_path)
+                seen_input_files.add(env_path)
             local_mounts = ["--bind", ""]
             for mount in (mounts[-1].split(","))[:-1]:
                 if not mount or ":" not in mount:
