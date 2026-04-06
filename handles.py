@@ -466,11 +466,13 @@ def _is_main_command_line(stripped):
 # These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
 # each Singularity container runs in the background and all exit codes are
 # collected before the job terminates.
+# _IL_LOGDIR, _IL_POD_NAME and _IL_POD_UID are injected into each generated
+# script so that per-container output files can be retrieved by LogsHandler.
 _RUN_CTN_HELPERS = r"""
 runCtn() {
   local ctn="$1"
   shift
-  ( "$@" ) > "${workingPath}/run-${ctn}.out" 2>&1 &
+  ( "$@" ) > "${_IL_LOGDIR}/${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
   local pid="$!"
   printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
   pidCtns="${pidCtns} ${pid}:${ctn}"
@@ -602,9 +604,17 @@ def produce_htcondor_singularity_script(
     cleanup_scripts = [s for s in cleanup_scripts if s]
 
     try:
+        # Absolute path to the data-root folder so the generated bash script
+        # can write per-container output files to a stable location that is
+        # accessible even when HTCondor runs the job from a scratch directory.
+        abs_dataroot = os.path.realpath(datarootfolder)
+
         with open(executable_path, "w") as f:
-            # ---- shebang ------------------------------------------------
+            # ---- shebang + pod-specific log variables -------------------
             script_body = "#!/bin/bash\n"
+            script_body += f"export _IL_LOGDIR={shlex.quote(abs_dataroot)}\n"
+            script_body += f"export _IL_POD_NAME={shlex.quote(name)}\n"
+            script_body += f"export _IL_POD_UID={shlex.quote(uid)}\n"
 
             # ---- probe cleanup traps (must be defined before any trap) --
             for cs in cleanup_scripts:
@@ -1205,17 +1215,45 @@ def StatusHandler():
 
 def LogsHandler():
     logging.info("HTCondor Sidecar: received GetLogs call")
-    request_data_string = request.data.decode("utf-8")
-    # print(request_data_string)
-    req = json.loads(request_data_string)
-    if req is None or not isinstance(req, dict):
-        # print("Invalid logs request body is: ", req)
-        logging.error("Invalid request data")
-        return "Invalid request data for getting logs", 400
+    try:
+        request_data_string = request.data.decode("utf-8")
+        req = json.loads(request_data_string)
+        if req is None or not isinstance(req, dict):
+            logging.error("Invalid request data")
+            return "Invalid request data for getting logs", 400
 
-    resp = "NOT IMPLEMENTED"
+        pod_name = req.get("PodName", "")
+        pod_uid = req.get("PodUID", "")
+        container_name = req.get("ContainerName", "")
 
-    return json.dumps(resp), 200
+        if not pod_name or not pod_uid or not container_name:
+            logging.warning(
+                "GetLogs: missing PodName/PodUID/ContainerName in request"
+            )
+            return "", 200
+
+        datarootfolder = InterLinkConfigInst["DataRootFolder"]
+        log_file = os.path.join(
+            datarootfolder, f"{pod_name}-{pod_uid}-{container_name}.out"
+        )
+
+        logging.info(f"GetLogs: reading {log_file}")
+        try:
+            with open(log_file, "r", errors="replace") as fh:
+                content = fh.read()
+            opts = req.get("Opts", {})
+            tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
+            if tail and tail > 0:
+                lines = content.splitlines(keepends=True)
+                content = "".join(lines[-tail:])
+            return content, 200, {"Content-Type": "text/plain"}
+        except FileNotFoundError:
+            logging.info(f"GetLogs: log file not found yet: {log_file}")
+            return "", 200
+
+    except Exception as e:
+        logging.error(f"Error in LogsHandler: {e}")
+        return "", 200
 
 
 def SystemInfoHandler():
