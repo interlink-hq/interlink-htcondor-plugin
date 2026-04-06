@@ -330,18 +330,22 @@ def mount_empty_dir(container, pod):
         for mount_spec in container["volumeMounts"]:
             pod_volume_spec = None
             for vol in pod["spec"]["volumes"]:
-                if vol.name == mount_spec["name"]:
-                    pod_volume_spec = vol["volumeSource"]
+                if vol["name"] == mount_spec["name"]:
+                    pod_volume_spec = vol
                     break
-            if pod_volume_spec and pod_volume_spec["EmptyDir"]:
+            if pod_volume_spec and "emptyDir" in pod_volume_spec:
                 ed_path = os.path.join(
                     InterLinkConfigInst["DataRootFolder"],
-                    pod.namespace + "-" + str(pod.uid) + "/emptyDirs/" + vol.name,
+                    pod["metadata"]["namespace"]
+                    + "-"
+                    + str(pod["metadata"]["uid"])
+                    + "/emptyDirs/"
+                    + vol["name"],
                 )
                 cmd = ["-p", ed_path]
                 subprocess.run(["mkdir"] + cmd, check=True)
                 ed_path += (
-                    ":" + mount_spec["mount_path"] + "/" + mount_spec["name"] + ","
+                    ":" + mount_spec["mountPath"] + "/" + mount_spec["name"] + ","
                 )
 
     return ed_path
