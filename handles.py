@@ -648,19 +648,29 @@ def produce_htcondor_singularity_script(
 
             f.write(script_body)
 
+        # Ensure log/out/err subdirectories exist under the data root so that
+        # HTCondor can write the job's Log/Output/Error files there.
+        for subdir in ("log", "out", "err"):
+            subdir_path = os.path.join(abs_dataroot, subdir)
+            os.makedirs(subdir_path, exist_ok=True)
+            os.chmod(subdir_path, 0o1777)
+
         # Per-container output files that HTCondor will transfer from the
         # scratch directory back to the data root when the job finishes.
         output_files = [
             f"{name}-{uid}-{ctn_name}.out" for ctn_name, _ in container_commands
         ]
+        transfer_input_line = (
+            f"transfer_input_files = {','.join(input_files)}" if input_files else ""
+        )
         job = f"""
 Executable = {executable_path}
 
-Log        = log/mm_mul.$(Cluster).$(Process).log
-Output     = out/mm_mul.out.$(Cluster).$(Process)
-Error      = err/mm_mul.err.$(Cluster).$(Process)
+Log        = {abs_dataroot}/log/mm_mul.$(Cluster).$(Process).log
+Output     = {abs_dataroot}/out/mm_mul.out.$(Cluster).$(Process)
+Error      = {abs_dataroot}/err/mm_mul.err.$(Cluster).$(Process)
 
-transfer_input_files = {",".join(input_files)}
+{transfer_input_line}
 transfer_output_files = {",".join(output_files)}
 output_destination = {abs_dataroot}/
 should_transfer_files = YES
@@ -700,12 +710,17 @@ def produce_htcondor_host_script(container, metadata):
         requested_cpu = parse_cpu(container["resources"]["requests"]["cpu"])
         # requested_memory = int(container['resources']['requests']['memory'])/1e6
         requested_memory = container["resources"]["requests"]["memory"]
+        abs_dataroot = os.path.realpath(datarootfolder)
+        for subdir in ("log", "out", "err"):
+            subdir_path = os.path.join(abs_dataroot, subdir)
+            os.makedirs(subdir_path, exist_ok=True)
+            os.chmod(subdir_path, 0o1777)
         job = f"""
 Executable = {executable_path}
 
-Log        = log/mm_mul.$(Cluster).$(Process).log
-Output     = out/mm_mul.out.$(Cluster).$(Process)
-Error      = err/mm_mul.err.$(Cluster).$(Process)
+Log        = {abs_dataroot}/log/mm_mul.$(Cluster).$(Process).log
+Output     = {abs_dataroot}/out/mm_mul.out.$(Cluster).$(Process)
+Error      = {abs_dataroot}/err/mm_mul.err.$(Cluster).$(Process)
 
 should_transfer_files = YES
 RequestCpus = {requested_cpu}
