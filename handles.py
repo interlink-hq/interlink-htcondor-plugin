@@ -466,13 +466,14 @@ def _is_main_command_line(stripped):
 # These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
 # each Singularity container runs in the background and all exit codes are
 # collected before the job terminates.
-# _IL_LOGDIR, _IL_POD_NAME and _IL_POD_UID are injected into each generated
-# script so that per-container output files can be retrieved by LogsHandler.
+# _IL_POD_NAME and _IL_POD_UID are injected into each generated script so
+# that per-container output files are named uniquely and can be retrieved by
+# LogsHandler after HTCondor transfers them back on job completion.
 _RUN_CTN_HELPERS = r"""
 runCtn() {
   local ctn="$1"
   shift
-  ( "$@" ) > "${_IL_LOGDIR}/${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
+  ( "$@" ) > "${workingPath}/${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
   local pid="$!"
   printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
   pidCtns="${pidCtns} ${pid}:${ctn}"
@@ -604,15 +605,17 @@ def produce_htcondor_singularity_script(
     cleanup_scripts = [s for s in cleanup_scripts if s]
 
     try:
-        # Absolute path to the data-root folder so the generated bash script
-        # can write per-container output files to a stable location that is
-        # accessible even when HTCondor runs the job from a scratch directory.
+        # Absolute path to the data-root folder.  HTCondor transfers per-container
+        # output files from the scratch directory back to this directory when the
+        # job completes (via output_destination).  LogsHandler then reads them from
+        # here to serve kubectl-logs requests.
         abs_dataroot = os.path.realpath(datarootfolder)
 
         with open(executable_path, "w") as f:
-            # ---- shebang + pod-specific log variables -------------------
+            # ---- shebang + pod-specific variables -----------------------
+            # _IL_POD_NAME / _IL_POD_UID are used by runCtn() to build a
+            # unique per-container output filename inside the scratch dir.
             script_body = "#!/bin/bash\n"
-            script_body += f"export _IL_LOGDIR={shlex.quote(abs_dataroot)}\n"
             script_body += f"export _IL_POD_NAME={shlex.quote(name)}\n"
             script_body += f"export _IL_POD_UID={shlex.quote(uid)}\n"
 
@@ -645,6 +648,11 @@ def produce_htcondor_singularity_script(
 
             f.write(script_body)
 
+        # Per-container output files that HTCondor will transfer from the
+        # scratch directory back to the data root when the job finishes.
+        output_files = [
+            f"{name}-{uid}-{ctn_name}.out" for ctn_name, _ in container_commands
+        ]
         job = f"""
 Executable = {executable_path}
 
@@ -653,6 +661,8 @@ Output     = out/mm_mul.out.$(Cluster).$(Process)
 Error      = err/mm_mul.err.$(Cluster).$(Process)
 
 transfer_input_files = {",".join(input_files)}
+transfer_output_files = {",".join(output_files)}
+output_destination = {abs_dataroot}/
 should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
@@ -782,6 +792,20 @@ def delete_pod(pod):
     os.remove(f"{datarootfolder}{name}-{uid}.sh")
     os.remove(f"{datarootfolder}{name}-{uid}.jdl")
     os.remove(f"{datarootfolder}{name}-{uid}_env.env")
+
+    # Clean up per-container log files transferred back by HTCondor.
+    dataroot_real = os.path.realpath(datarootfolder)
+    try:
+        with os.scandir(datarootfolder) as it:
+            for entry in it:
+                if entry.name.startswith(f"{name}-{uid}-") and entry.name.endswith(
+                    ".out"
+                ):
+                    # Validate the path stays within the data root.
+                    if os.path.realpath(entry.path).startswith(dataroot_real + os.sep):
+                        os.remove(entry.path)
+    except OSError as e:
+        logging.warning(f"Could not clean up log files for {name}-{uid}: {e}")
 
     return preprocessed
 
@@ -1227,28 +1251,51 @@ def LogsHandler():
         container_name = req.get("ContainerName", "")
 
         if not pod_name or not pod_uid or not container_name:
-            logging.warning(
-                "GetLogs: missing PodName/PodUID/ContainerName in request"
-            )
+            logging.warning("GetLogs: missing PodName/PodUID/ContainerName in request")
             return "", 200
 
         datarootfolder = InterLinkConfigInst["DataRootFolder"]
-        log_file = os.path.join(
-            datarootfolder, f"{pod_name}-{pod_uid}-{container_name}.out"
-        )
+        dataroot_real = os.path.realpath(datarootfolder)
 
-        logging.info(f"GetLogs: reading {log_file}")
+        # Sanitize each name component.  os.path.basename strips embedded path
+        # separators; the regex further limits characters to those allowed in
+        # Kubernetes names (alphanumeric, hyphens, dots) plus UUID hyphens,
+        # preventing null bytes and other unexpected characters.
+        _safe = re.compile(r"^[a-zA-Z0-9._-]+$")
+        parts = {
+            "PodName": os.path.basename(pod_name),
+            "PodUID": os.path.basename(pod_uid),
+            "ContainerName": os.path.basename(container_name),
+        }
+        for field, value in parts.items():
+            if not value or not _safe.match(value):
+                logging.error(f"GetLogs: invalid {field} value: {value!r}")
+                return "", 400
+
+        log_filename = (
+            f"{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
+        )
+        log_file_real = os.path.realpath(os.path.join(datarootfolder, log_filename))
+
+        # After resolving symlinks, the file must live *inside* the data root
+        # (not equal to it and not outside it).
+        if not log_file_real.startswith(dataroot_real + os.sep):
+            logging.error(f"GetLogs: path traversal attempt blocked: {log_filename!r}")
+            return "", 400
+
+        logging.info(f"GetLogs: reading {log_file_real}")
         try:
-            with open(log_file, "r", errors="replace") as fh:
+            with open(log_file_real, "r", errors="replace") as fh:
                 content = fh.read()
             opts = req.get("Opts", {})
-            tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
-            if tail and tail > 0:
+            raw_tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
+            tail = raw_tail if isinstance(raw_tail, int) and raw_tail > 0 else 0
+            if tail > 0:
                 lines = content.splitlines(keepends=True)
                 content = "".join(lines[-tail:])
             return content, 200, {"Content-Type": "text/plain"}
         except FileNotFoundError:
-            logging.info(f"GetLogs: log file not found yet: {log_file}")
+            logging.info(f"GetLogs: log file not found yet: {log_file_real}")
             return "", 200
 
     except Exception as e:

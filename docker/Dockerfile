@@ -27,7 +27,8 @@ RUN ln -sf /usr/bin/apptainer /usr/bin/singularity && \
     echo 'STARTER_JOB_ENVIRONMENT = "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin APPTAINER_CACHEDIR=/tmp/apptainer-cache"' \
         > /etc/condor/config.d/99-job-env.conf && \
     touch /utils/condor_config && \
-    mkdir -p /utils/.interlink /utils/out /utils/err /utils/log
+    mkdir -p /utils/.interlink /utils/out /utils/err /utils/log && \
+    chmod 1777 /utils/.interlink /utils/out /utils/err /utils/log
 
 WORKDIR /utils
 
