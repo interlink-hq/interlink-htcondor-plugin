@@ -624,6 +624,7 @@ def produce_htcondor_singularity_script(
     # Create a unique job directory for all files related to this pod/job
     job_dir = os.path.join(abs_dataroot, f"{name}-{uid}")
     os.makedirs(job_dir, exist_ok=True)
+    os.chmod(job_dir, 0o1777)
     executable_path = os.path.join(job_dir, f"{name}-{uid}.sh")
     sub_path = os.path.join(job_dir, f"{name}-{uid}.jdl")
 
@@ -936,6 +937,7 @@ def handle_jid(jid, pod):
 
     job_dir = os.path.join(os.path.realpath(datarootfolder), f"{name}-{uid}")
     os.makedirs(job_dir, exist_ok=True)
+    os.chmod(job_dir, 0o1777)
     jid_path = os.path.join(job_dir, f"{name}-{uid}.jid")
     with open(jid_path, "w") as f:
         f.write(str(jid))
