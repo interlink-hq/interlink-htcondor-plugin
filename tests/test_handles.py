@@ -601,7 +601,9 @@ class TestCreateResponseFormat:
         )
         monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
         monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
-        (tmp_path / "test-pod-uid-123.jid").write_text("123.0")
+        job_dir = tmp_path / "test-pod-uid-123"
+        job_dir.mkdir()
+        (job_dir / "test-pod-uid-123.jid").write_text("123.0")
         monkeypatch.setattr(
             handles,
             "produce_htcondor_singularity_script",
@@ -635,7 +637,9 @@ class TestStatusHandlerMultiPod:
     """/status must return statuses for ALL pods in the request array."""
 
     def _make_jid_file(self, tmp_path, pod_name, pod_uid, jid):
-        (tmp_path / f"{pod_name}-{pod_uid}.jid").write_text(jid)
+        job_dir = tmp_path / f"{pod_name}-{pod_uid}"
+        job_dir.mkdir()
+        (job_dir / f"{pod_name}-{pod_uid}.jid").write_text(jid)
 
     def _setup_config(self, tmp_path, monkeypatch):
         """Patch InterLinkConfigInst to use tmp_path as data root."""
