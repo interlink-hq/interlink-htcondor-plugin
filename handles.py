@@ -69,6 +69,9 @@ dummy_job = args.dummy_job
 global JID
 JID = []
 
+# Maximum bytes to retrieve per condor_tail call (10 MiB).
+_CONDOR_TAIL_MAX_BYTES = 10 * 1024 * 1024
+
 
 def read_yaml_file(file_path):
     with open(file_path, "r") as file:
@@ -1479,17 +1482,22 @@ def LogsHandler():
             datarootfolder,
             f"{parts['PodName']}-{parts['PodUID']}.jid",
         )
-        if os.path.exists(jid_file):
+        # Validate the jid_file path stays within the data root before opening.
+        jid_file_real = os.path.realpath(jid_file)
+        if os.path.exists(jid_file) and jid_file_real.startswith(
+            dataroot_real + os.sep
+        ):
             try:
-                with open(jid_file, "r") as fh:
+                with open(jid_file_real, "r") as fh:
                     cluster_id = fh.read().strip()
                 if cluster_id.isdigit():
                     proc_id = f"{cluster_id}.0"
                     # condor_tail retrieves the file from the execute sandbox via
                     # the HTCondor networking protocol; works for running jobs and
                     # recently-completed jobs whose sandbox has not yet been cleaned.
-                    collector = getattr(args, "collector_host", None)
-                    schedd = getattr(args, "schedd_host", None)
+                    # proc_id is digits + ".0"; log_filename is validated by _safe.
+                    collector = args.collector_host
+                    schedd = args.schedd_host
                     if collector and schedd:
                         cmd = [
                             "condor_tail",
@@ -1498,7 +1506,7 @@ def LogsHandler():
                             "-name",
                             schedd,
                             "-maxbytes",
-                            "10485760",
+                            str(_CONDOR_TAIL_MAX_BYTES),
                             proc_id,
                             log_filename,
                         ]
@@ -1506,12 +1514,12 @@ def LogsHandler():
                         cmd = [
                             "condor_tail",
                             "-maxbytes",
-                            "10485760",
+                            str(_CONDOR_TAIL_MAX_BYTES),
                             proc_id,
                             log_filename,
                         ]
                     result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=30
+                        cmd, capture_output=True, text=True, timeout=60
                     )
                     if result.returncode == 0 and result.stdout:
                         content = result.stdout
@@ -1521,9 +1529,13 @@ def LogsHandler():
                         )
                     else:
                         logging.info(
-                            f"GetLogs: condor_tail returned rc={result.returncode}"
+                            f"GetLogs: condor_tail rc={result.returncode}"
                             f" ({result.stderr.strip()!r}), falling back to file"
                         )
+                else:
+                    logging.warning(
+                        f"GetLogs: invalid cluster_id in {jid_file}: {cluster_id!r}"
+                    )
             except Exception as e:
                 logging.info(f"GetLogs: condor_tail failed ({e}), falling back to file")
 
