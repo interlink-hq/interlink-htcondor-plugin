@@ -16,6 +16,7 @@ from probes import (
     translate_kubernetes_probes,
 )
 
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--schedd-name", help="Schedd name", type=str, default="")
@@ -146,8 +147,12 @@ def prepare_env_file(container, metadata, container_standalone=None):
     keys from the referenced Secrets / ConfigMaps are also injected.
     """
     env_file_name = f"{metadata['name']}-{metadata['uid']}_env.env"
-    job_dir = os.path.join(os.path.realpath(InterLinkConfigInst["DataRootFolder"]), f"{metadata['name']}-{metadata['uid']}")
+    job_dir = os.path.join(
+        os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+        f"{metadata['name']}-{metadata['uid']}",
+    )
     os.makedirs(job_dir, exist_ok=True)
+    os.chmod(job_dir, 0o1777)
     env_file_path = os.path.join(job_dir, env_file_name)
     lines = []
 
@@ -211,44 +216,47 @@ def prepare_mounts(pod, container_standalone):
     for c in pod["spec"]["containers"]:
         if c["name"] == container_standalone["name"]:
             container = c
-    try:
-        os.makedirs(pod_name_folder, exist_ok=True)
-        logging.info(f"Successfully created folder {pod_name_folder}")
-    except Exception as e:
-        logging.error(e)
-    if "volumeMounts" in container.keys():
-        for mount_var in container["volumeMounts"]:
-            path = ""
-            for vol in pod["spec"]["volumes"]:
-                if vol["name"] != mount_var["name"]:
-                    continue
-                if "configMap" in vol.keys():
-                    config_maps_paths = mountConfigMaps(pod, container_standalone)
-                    # print("bind as configmap", mount_var["name"], vol["name"])
-                    for i, path in enumerate(config_maps_paths):
-                        mount_data.append(path)
-                elif "secret" in vol.keys():
-                    secrets_paths = mountSecrets(pod, container_standalone)
-                    # print("bind as secret", mount_var["name"], vol["name"])
-                    for i, path in enumerate(secrets_paths):
-                        mount_data.append(path)
-                elif "emptyDir" in vol.keys():
-                    path = mount_empty_dir(container, pod)
-                    mount_data.append(path)
-                elif "hostPath" in vol.keys():
-                    host_path = vol["hostPath"]["path"]
-                    mount_path = mount_var["mountPath"]
-                    bind_path = f"{host_path}:{mount_path}"
-                    mount_data.append(bind_path)
-                else:
-                    # Implement logic for other volume types if required.
-                    logging.info("\n*********\n*To be implemented*\n********")
-    else:
-        logging.info("Container has no volume mount")
-        return [""]
+            try:
+                os.makedirs(pod_name_folder, exist_ok=True)
+                os.chmod(pod_name_folder, 0o1777)
+                logging.info(f"Successfully created folder {pod_name_folder}")
+            except Exception as e:
+                logging.error(e)
+            if "volumeMounts" in container.keys():
+                for mount_var in container["volumeMounts"]:
+                    path = ""
+                    for vol in pod["spec"]["volumes"]:
+                        if vol["name"] != mount_var["name"]:
+                            continue
+                        if "configMap" in vol.keys():
+                            config_maps_paths = mountConfigMaps(
+                                pod, container_standalone
+                            )
+                            # print("bind as configmap", mount_var["name"], vol["name"])
+                            for i, path in enumerate(config_maps_paths):
+                                mount_data.append(path)
+                        elif "secret" in vol.keys():
+                            secrets_paths = mountSecrets(pod, container_standalone)
+                            # print("bind as secret", mount_var["name"], vol["name"])
+                            for i, path in enumerate(secrets_paths):
+                                mount_data.append(path)
+                        elif "emptyDir" in vol.keys():
+                            path = mount_empty_dir(container, pod)
+                            mount_data.append(path)
+                        elif "hostPath" in vol.keys():
+                            host_path = vol["hostPath"]["path"]
+                            mount_path = mount_var["mountPath"]
+                            bind_path = f"{host_path}:{mount_path}"
+                            mount_data.append(bind_path)
+                        else:
+                            # Implement logic for other volume types if required.
+                            logging.info("\n*********\n*To be implemented*\n********")
+            else:
+                logging.info("Container has no volume mount")
+                return [""]
 
-    path_hardcoded = ""
-    mount_data.append(path_hardcoded)
+            path_hardcoded = ""
+            mount_data.append(path_hardcoded)
     mounts.append(",".join(mount_data))
     print("mounts are", mounts)
     if mounts[1] == "":
@@ -272,12 +280,21 @@ def mountConfigMaps(pod, container_standalone):
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         data_root_folder = InterLinkConfigInst["DataRootFolder"]
         # Clean and recreate per-job configMaps folder
-        job_dir = os.path.join(os.getcwd(), data_root_folder, f"{pod['metadata']['name']}-{pod['metadata']['uid']}")
+        job_dir = os.path.join(
+            os.getcwd(),
+            data_root_folder,
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
         pod_configmaps_root = os.path.join(job_dir, "configMaps")
         cmd = ["-rf", pod_configmaps_root]
-        shell = subprocess.Popen([
-            "rm",
-        ] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        shell = subprocess.Popen(
+            [
+                "rm",
+            ]
+            + cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         _, err = shell.communicate()
 
         if err:
@@ -331,7 +348,11 @@ def mountSecrets(pod, container_standalone):
     container = extract_container(pod, container_standalone)
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         data_root_folder = InterLinkConfigInst["DataRootFolder"]
-        job_dir = os.path.join(os.getcwd(), data_root_folder, f"{pod['metadata']['name']}-{pod['metadata']['uid']}")
+        job_dir = os.path.join(
+            os.getcwd(),
+            data_root_folder,
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
         pod_secrets_root = os.path.join(job_dir, "secrets")
         cmd = ["-rf", pod_secrets_root]
         subprocess.run(["rm"] + cmd, check=True)
@@ -371,7 +392,11 @@ def mountSecrets(pod, container_standalone):
 def mount_empty_dir(container, pod):
     ed_path = None
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
-        job_dir = os.path.join(os.getcwd(), InterLinkConfigInst["DataRootFolder"], f"{pod['metadata']['namespace']}-{pod['metadata']['uid']}")
+        job_dir = os.path.join(
+            os.getcwd(),
+            InterLinkConfigInst["DataRootFolder"],
+            f"{pod['metadata']['namespace']}-{pod['metadata']['uid']}",
+        )
         cmd = ["-rf", os.path.join(job_dir, "emptyDirs")]
         subprocess.run(["rm"] + cmd, check=True)
         for mount_spec in container["volumeMounts"]:
@@ -752,9 +777,9 @@ def produce_htcondor_singularity_script(
 Executable = {executable_path}
 InitialDir = {job_dir}
 
-Log        = {job_dir}/log/mm_mul.$(Cluster).$(Process).log
-Output     = {job_dir}/out/mm_mul.out.$(Cluster).$(Process)
-Error      = {job_dir}/err/mm_mul.err.$(Cluster).$(Process)
+Log        = log/mm_mul.$(Cluster).$(Process).log
+Output     = out/mm_mul.out.$(Cluster).$(Process)
+Error      = err/mm_mul.err.$(Cluster).$(Process)
 
 {transfer_input_line}
 {transfer_output_line}
@@ -762,6 +787,8 @@ should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
 
+# Retry if the job is held due to the permission error (Code 12, Subcode 13)
+periodic_release = (HoldReasonCode == 12 && HoldReasonSubCode == 13)
 when_to_transfer_output = ON_EXIT_OR_EVICT
 +MaxWallTimeMins = 60
 
@@ -787,7 +814,7 @@ def produce_htcondor_host_script(container, metadata):
     sub_path = f"{datarootfolder}{name}-{uid}.jdl"
     try:
         with open(executable_path, "w") as f:
-            batch_macros = f"""#!{container['command'][-1]}
+            batch_macros = f"""#!{container["command"][-1]}
 """ + "\n".join(container["args"][-1].split("; "))
 
             f.write(batch_macros)
@@ -803,14 +830,16 @@ def produce_htcondor_host_script(container, metadata):
         job = f"""
 Executable = {executable_path}
 
-Log        = {abs_dataroot}/log/mm_mul.$(Cluster).$(Process).log
-Output     = {abs_dataroot}/out/mm_mul.out.$(Cluster).$(Process)
-Error      = {abs_dataroot}/err/mm_mul.err.$(Cluster).$(Process)
+Log        = log/mm_mul.$(Cluster).$(Process).log
+Output     = out/mm_mul.out.$(Cluster).$(Process)
+Error      = err/mm_mul.err.$(Cluster).$(Process)
 
 should_transfer_files = YES
 RequestCpus = {requested_cpu}
 RequestMemory = {requested_memory}
 
+# Retry if the job is held due to the permission error (Code 12, Subcode 13)
+periodic_release = (HoldReasonCode == 12 && HoldReasonSubCode == 13)
 when_to_transfer_output = ON_EXIT_OR_EVICT
 +MaxWallTimeMins = 60
 
@@ -876,7 +905,6 @@ def htcondor_batch_submit(job):
 
 
 def delete_pod(pod):
-
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = pod["metadata"]["name"]
     uid = pod["metadata"]["uid"]
@@ -1229,8 +1257,13 @@ def SubmitHandler():
         handle_jid(out_jid, pod)
 
         # Verify job submission was successful: the JID file should live in the per-job directory
-        job_dir = os.path.join(os.path.realpath(InterLinkConfigInst["DataRootFolder"]), f"{pod['metadata']['name']}-{pod['metadata']['uid']}")
-        jid_file = os.path.join(job_dir, f"{pod['metadata']['name']}-{pod['metadata']['uid']}.jid")
+        job_dir = os.path.join(
+            os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
+        )
+        jid_file = os.path.join(
+            job_dir, f"{pod['metadata']['name']}-{pod['metadata']['uid']}.jid"
+        )
         if not os.path.exists(jid_file):
             raise Exception("JID file was not created")
 
@@ -1324,8 +1357,13 @@ def StatusHandler():
     resp = []
     for req in req_list:
         try:
-            job_dir = os.path.join(os.path.realpath(InterLinkConfigInst["DataRootFolder"]), f"{req['metadata']['name']}-{req['metadata']['uid']}")
-            jid_file = os.path.join(job_dir, f"{req['metadata']['name']}-{req['metadata']['uid']}.jid")
+            job_dir = os.path.join(
+                os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+                f"{req['metadata']['name']}-{req['metadata']['uid']}",
+            )
+            jid_file = os.path.join(
+                job_dir, f"{req['metadata']['name']}-{req['metadata']['uid']}.jid"
+            )
             with open(jid_file, "r") as f:
                 jid_job = f.read().strip()
             podname = req["metadata"]["name"]
@@ -1454,6 +1492,11 @@ def LogsHandler():
         pod_uid = req.get("PodUID", "")
         container_name = req.get("ContainerName", "")
 
+        job_dir = os.path.join(
+            os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
+            f"{pod_name}-{pod_uid}",
+        )
+
         if not pod_name or not pod_uid or not container_name:
             logging.warning("GetLogs: missing PodName/PodUID/ContainerName in request")
             return "", 200
@@ -1479,9 +1522,7 @@ def LogsHandler():
         # The per-container output file is written to the HTCondor execute sandbox
         # as a relative path by runCtn().  condor_tail retrieves it directly from
         # the execute node without requiring a shared filesystem.
-        log_filename = (
-            f"{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
-        )
+        log_filename = f"{job_dir}/{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
 
         opts = req.get("Opts", {})
         raw_tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
@@ -1490,7 +1531,9 @@ def LogsHandler():
         content = None
 
         # --- Try condor_tail first (no shared filesystem required) ---
-        job_dir = os.path.join(os.path.realpath(datarootfolder), f"{parts['PodName']}-{parts['PodUID']}")
+        job_dir = os.path.join(
+            os.path.realpath(datarootfolder), f"{parts['PodName']}-{parts['PodUID']}"
+        )
         jid_file = os.path.join(job_dir, f"{parts['PodName']}-{parts['PodUID']}.jid")
         # Validate the jid_file path stays within the data root before opening.
         jid_file_real = os.path.realpath(jid_file)
