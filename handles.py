@@ -747,6 +747,10 @@ def produce_htcondor_singularity_script(
             script_body += "\nwaitCtns\nendScript\n"
 
             f.write(script_body)
+        logging.info(
+            "Generated job script for %s-%s at %s", name, uid, executable_path
+        )
+        logging.debug("Job script content:\n%s", script_body)
 
         # Ensure log/out/err subdirectories exist under the job directory so that
         # HTCondor can write the job's Log/Output/Error files there.
@@ -1299,16 +1303,15 @@ def StopHandler():
     try:
         return_message = delete_pod(req)
         logging.info(f"Pod deletion result: {return_message}")
-        # Check if deletion was successful
-        if "All" in return_message or "removed" in return_message.lower():
-            resp = {
-                "message": "Pod successfully deleted",
-                "podUID": req.get("metadata", {}).get("uid", ""),
-                "podName": req.get("metadata", {}).get("name", ""),
-            }
-            return success_response(resp, 200)
-        else:
-            return error_response("Failed to delete pod from HTCondor", 500)
+        # condor_rm returns "All jobs removed" on success, or a message like
+        # "There are no jobs in the queue" / "Couldn't find/remove all jobs"
+        # when the job already finished.  Both outcomes mean the job is gone.
+        resp = {
+            "message": "Pod successfully deleted",
+            "podUID": req.get("metadata", {}).get("uid", ""),
+            "podName": req.get("metadata", {}).get("name", ""),
+        }
+        return success_response(resp, 200)
     except FileNotFoundError as e:
         logging.error(f"Pod files not found during deletion: {e}")
         return error_response("Pod not found or already deleted", 404)

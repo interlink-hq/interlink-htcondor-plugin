@@ -303,8 +303,143 @@ else
     done
     docker exec htcondor-sidecar \
       cat "/tmp/smoke-test.${SMOKE_JID}.0.out" 2>/dev/null || true
+    docker exec htcondor-sidecar \
+      condor_history "${SMOKE_JID}" 2>/dev/null || true
   else
     echo "WARNING: Could not parse smoke test job ID from: ${SUBMIT_OUT}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Diagnostic smoke tests: test apptainer as root vs condor user
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Diagnostic: apptainer as root (docker exec) ==="
+docker exec htcondor-sidecar \
+  bash -c 'echo "TEST_DIAG=root_level" > /tmp/diag.env && singularity exec --env-file /tmp/diag.env docker://alpine:3.20 sh -c "echo apptainer-as-root-ok; echo TEST_DIAG=\$TEST_DIAG"' \
+  2>&1 || echo "WARNING: apptainer as root FAILED (exit $?)"
+
+echo ""
+echo "=== Diagnostic: apptainer as condor user (via docker exec --user) ==="
+docker exec --user condor htcondor-sidecar \
+  bash -c 'echo "TEST_DIAG=condor_level" > /tmp/diag-condor.env && singularity exec --env-file /tmp/diag-condor.env docker://alpine:3.20 sh -c "echo apptainer-as-condor-ok; echo TEST_DIAG=\$TEST_DIAG"' \
+  2>&1 || echo "WARNING: apptainer as condor user FAILED (exit $?)"
+
+# ---------------------------------------------------------------------------
+# Comprehensive condor smoke test: full plugin-style job with InitialDir,
+# transfer_input_files, transfer_output_files, runCtn/waitCtns helpers.
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Comprehensive condor+apptainer smoke test (plugin job structure) ==="
+
+# Create a job directory inside the container via docker exec
+docker exec htcondor-sidecar bash -c '
+  mkdir -p /tmp/plugin-smoke
+  chmod 1777 /tmp/plugin-smoke
+  echo "PLUGIN_SMOKE_VAR=plugin_level_ok" > /tmp/plugin-smoke/plugin-smoke_env.env
+'
+
+# Write the job script (mimics the plugin runCtn/waitCtns pattern)
+cat > "${TEST_DIR}/plugin-smoke.sh" << 'PLUGIN_SH_EOF'
+#!/bin/bash
+export _IL_POD_NAME=plugin-smoke
+export _IL_POD_UID=smoke-test-uid
+
+runCtn() {
+  local ctn="$1"
+  shift
+  ( "$@" ) > "${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
+  local pid="$!"
+  printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
+  pidCtns="${pidCtns} ${pid}:${ctn}"
+}
+
+waitCtns() {
+  for pidCtn in ${pidCtns}; do
+    local pid="${pidCtn%:*}"
+    local ctn="${pidCtn#*:}"
+    printf '%s\n' "$(date -Is --utc) Waiting for ${ctn} (pid ${pid})..."
+    wait "${pid}"
+    local exitCode="$?"
+    printf '%s\n' "${exitCode}" > "${workingPath}/run-${ctn}.status"
+    printf '%s\n' "$(date -Is --utc) ${ctn} ended with status ${exitCode}."
+  done
+  for filestatus in "${workingPath}"/*.status; do
+    [ -f "$filestatus" ] || continue
+    local exitCode
+    exitCode=$(cat "$filestatus")
+    [ "${highestExitCode}" -lt "${exitCode}" ] && highestExitCode="${exitCode}"
+  done
+}
+
+endScript() {
+  printf '%s\n' "$(date -Is --utc) End of script, exit: ${highestExitCode}."
+  exit "${highestExitCode}"
+}
+
+highestExitCode=0
+pidCtns=""
+export workingPath=$(pwd)
+
+runCtn container singularity exec --env-file plugin-smoke_env.env docker://alpine:3.20 sh -c 'echo plugin-condor-apptainer-ok; echo PLUGIN_SMOKE_VAR=$PLUGIN_SMOKE_VAR'
+waitCtns
+endScript
+PLUGIN_SH_EOF
+chmod +x "${TEST_DIR}/plugin-smoke.sh"
+
+cat > "${TEST_DIR}/plugin-smoke.jdl" << 'PLUGIN_JDL_EOF'
+Executable = /tmp/plugin-smoke/plugin-smoke.sh
+InitialDir = /tmp/plugin-smoke
+Log        = /tmp/plugin-smoke/plugin-smoke.$(Cluster).$(Process).log
+Output     = /tmp/plugin-smoke/plugin-smoke.$(Cluster).$(Process).out
+Error      = /tmp/plugin-smoke/plugin-smoke.$(Cluster).$(Process).err
+universe   = vanilla
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT_OR_EVICT
+transfer_input_files = /tmp/plugin-smoke/plugin-smoke_env.env
+transfer_output_files = plugin-smoke-smoke-test-uid-container.out
+Queue 1
+PLUGIN_JDL_EOF
+
+docker cp "${TEST_DIR}/plugin-smoke.sh"  htcondor-sidecar:/tmp/plugin-smoke/plugin-smoke.sh
+docker cp "${TEST_DIR}/plugin-smoke.jdl" htcondor-sidecar:/tmp/plugin-smoke/plugin-smoke.jdl
+
+set +e
+PLUGIN_SUBMIT_OUT=$(docker exec htcondor-sidecar condor_submit /tmp/plugin-smoke/plugin-smoke.jdl 2>&1)
+PLUGIN_SUBMIT_STATUS=$?
+set -e
+
+if [ "${PLUGIN_SUBMIT_STATUS}" -ne 0 ]; then
+  echo "WARNING: Plugin-style smoke test submission failed:"
+  echo "${PLUGIN_SUBMIT_OUT}"
+else
+  PLUGIN_JID=$(printf '%s\n' "${PLUGIN_SUBMIT_OUT}" \
+    | awk 'match($0, /cluster ([0-9]+)/, m) { print m[1]; exit }')
+  if [[ "${PLUGIN_JID}" =~ ^[0-9]+$ ]]; then
+    echo "  Plugin smoke test job submitted (cluster ID ${PLUGIN_JID})"
+    echo "  Waiting up to 3 min for plugin smoke test job to finish..."
+    for i in $(seq 1 18); do
+      PLUGIN_JOB_STATE=$(docker exec htcondor-sidecar \
+        condor_q "${PLUGIN_JID}" -format "%d\n" JobStatus 2>/dev/null || true)
+      if [ -z "${PLUGIN_JOB_STATE}" ]; then
+        echo "  ✓ Plugin smoke test job ${PLUGIN_JID} completed"
+        break
+      fi
+      echo "    Job status: ${PLUGIN_JOB_STATE} (${i}/18)"
+      sleep 10
+    done
+    echo "--- Plugin smoke test condor output ---"
+    docker exec htcondor-sidecar \
+      cat "/tmp/plugin-smoke/plugin-smoke.${PLUGIN_JID}.0.out" 2>/dev/null || true
+    echo "--- Plugin smoke test job output (.out file from execute sandbox) ---"
+    docker exec htcondor-sidecar \
+      cat "/tmp/plugin-smoke/plugin-smoke-smoke-test-uid-container.out" 2>/dev/null \
+      || echo "(output file not found - may indicate transfer_output_files failure)"
+    echo "--- Plugin smoke test condor history ---"
+    docker exec htcondor-sidecar \
+      condor_history "${PLUGIN_JID}" -format "ExitCode=%d\n" ExitCode 2>/dev/null || true
+  else
+    echo "WARNING: Could not parse plugin smoke test job ID from: ${PLUGIN_SUBMIT_OUT}"
   fi
 fi
 

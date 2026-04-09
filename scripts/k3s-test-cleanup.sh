@@ -61,9 +61,27 @@ fi
 if [ -n "${TEST_DIR}" ]; then
   echo "Saving container logs to ${TEST_DIR}..."
   docker logs htcondor-sidecar > "${TEST_DIR}/htcondor-sidecar.log" 2>&1 || true
+
+  echo "Saving HTCondor system logs from container..."
+  docker exec htcondor-sidecar \
+    bash -c 'cat /var/log/condor/StarterLog 2>/dev/null || true' \
+    > "${TEST_DIR}/condor-StarterLog.log" 2>&1 || true
+  docker exec htcondor-sidecar \
+    bash -c 'cat /var/log/condor/ShadowLog 2>/dev/null || true' \
+    > "${TEST_DIR}/condor-ShadowLog.log" 2>&1 || true
+  docker exec htcondor-sidecar \
+    bash -c 'cat /var/log/condor/SchedLog 2>/dev/null || true' \
+    > "${TEST_DIR}/condor-SchedLog.log" 2>&1 || true
+
+  echo "Saving condor_history from container..."
+  docker exec htcondor-sidecar \
+    condor_history -long 2>/dev/null \
+    > "${TEST_DIR}/condor-history.log" 2>&1 || true
+
   echo "Copying HTCondor job directories from container..."
+  mkdir -p "${TEST_DIR}/plugin-jobs"
   docker cp htcondor-sidecar:/utils/.interlink/. \
-    "${TEST_DIR}/plugin-jobs/" 2>/dev/null || true
+    "${TEST_DIR}/plugin-jobs/" 2>&1 || true
 fi
 
 # ---------------------------------------------------------------------------
