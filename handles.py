@@ -504,15 +504,15 @@ def _is_main_command_line(stripped):
 # These implement the SLURM-plugin runCtn/waitCtns/endScript pattern so that
 # each Singularity container runs in the background and all exit codes are
 # collected before the job terminates.
-# _IL_POD_NAME, _IL_POD_UID, and _IL_OUTPUT_DIR are injected into each
-# generated script so that per-container output files are written directly
-# to the data-root directory (accessible by the condor user because it is
-# chmod 1777) and can be retrieved by LogsHandler for kubectl-logs requests.
+# _IL_POD_NAME and _IL_POD_UID are injected into each generated script.
+# Per-container output files are written to the HTCondor execute sandbox as
+# relative paths (e.g. "${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out") and
+# retrieved by LogsHandler via condor_tail (no shared filesystem required).
 _RUN_CTN_HELPERS = r"""
 runCtn() {
   local ctn="$1"
   shift
-  ( "$@" ) > "${_IL_OUTPUT_DIR}/${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
+  ( "$@" ) > "${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out" 2>&1 &
   local pid="$!"
   printf '%s\n' "$(date -Is --utc) Running ${ctn} in background (pid ${pid})..."
   pidCtns="${pidCtns} ${pid}:${ctn}"
@@ -614,8 +614,9 @@ def produce_htcondor_singularity_script(
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
     uid = metadata["uid"]
-    executable_path = f"./{datarootfolder}/{name}-{uid}.sh"
-    sub_path = f"./{datarootfolder}/{name}-{uid}.jdl"
+    abs_dataroot = os.path.realpath(datarootfolder)
+    executable_path = os.path.join(abs_dataroot, f"{name}-{uid}.sh")
+    sub_path = os.path.join(abs_dataroot, f"{name}-{uid}.jdl")
 
     requested_cpus = 0
     requested_memory = 0
@@ -656,22 +657,13 @@ def produce_htcondor_singularity_script(
     cleanup_scripts = [s for s in cleanup_scripts if s]
 
     try:
-        # Absolute path to the data-root folder.  HTCondor transfers per-container
-        # output files from the scratch directory back to this directory when the
-        # job completes (via output_destination).  LogsHandler then reads them from
-        # here to serve kubectl-logs requests.
-        abs_dataroot = os.path.realpath(datarootfolder)
-
         with open(executable_path, "w") as f:
             # ---- shebang + pod-specific variables -----------------------
-            # _IL_POD_NAME / _IL_POD_UID / _IL_OUTPUT_DIR are used by
-            # runCtn() to write per-container output directly to the
-            # data-root directory (chmod 1777) so no HTCondor file
-            # transfer is needed.
+            # _IL_POD_NAME / _IL_POD_UID are used by runCtn() to name the
+            # per-container output files in the HTCondor execute sandbox.
             script_body = "#!/bin/bash\n"
             script_body += f"export _IL_POD_NAME={shlex.quote(name)}\n"
             script_body += f"export _IL_POD_UID={shlex.quote(uid)}\n"
-            script_body += f"export _IL_OUTPUT_DIR={shlex.quote(abs_dataroot)}\n"
 
             # ---- probe cleanup traps (must be defined before any trap) --
             for cs in cleanup_scripts:
@@ -695,10 +687,7 @@ def produce_htcondor_singularity_script(
                 )
                 for ctn_name, cmd_tokens in init_container_commands:
                     cleaned = _clean_command_tokens(cmd_tokens)
-                    out_file = (
-                        f'"${{_IL_OUTPUT_DIR}}/${{_IL_POD_NAME}}'
-                        f'-${{_IL_POD_UID}}-{ctn_name}.out"'
-                    )
+                    out_file = f'"${{_IL_POD_NAME}}-${{_IL_POD_UID}}-{ctn_name}.out"'
                     script_body += f"{cleaned} > {out_file} 2>&1\n"
                     fail_msg = f"Init container {ctn_name} failed with exit code"
                     script_body += (
@@ -734,15 +723,34 @@ def produce_htcondor_singularity_script(
         transfer_input_line = (
             f"transfer_input_files = {','.join(input_files)}" if input_files else ""
         )
+
+        # Build the list of per-container output files HTCondor should transfer back
+        # from the execute sandbox to InitialDir (abs_dataroot) on the submit node.
+        # These files are created in the sandbox using relative paths by runCtn().
+        # LogsHandler retrieves them via condor_tail (works without shared filesystem);
+        # reading the transferred copy serves as a fallback for completed jobs.
+        all_ctn_names = [ctn for ctn, _ in (init_container_commands or [])] + [
+            ctn for ctn, _ in container_commands
+        ]
+        transfer_output_files = ",".join(
+            f"{name}-{uid}-{ctn}.out" for ctn in all_ctn_names
+        )
+        transfer_output_line = (
+            f"transfer_output_files = {transfer_output_files}"
+            if transfer_output_files
+            else 'transfer_output_files = ""'
+        )
+
         job = f"""
 Executable = {executable_path}
+InitialDir = {abs_dataroot}
 
 Log        = {abs_dataroot}/log/mm_mul.$(Cluster).$(Process).log
 Output     = {abs_dataroot}/out/mm_mul.out.$(Cluster).$(Process)
 Error      = {abs_dataroot}/err/mm_mul.err.$(Cluster).$(Process)
 
 {transfer_input_line}
-transfer_output_files = ""
+{transfer_output_line}
 should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
@@ -1453,31 +1461,96 @@ def LogsHandler():
                 logging.error(f"GetLogs: invalid {field} value: {value!r}")
                 return "", 400
 
+        # The per-container output file is written to the HTCondor execute sandbox
+        # as a relative path by runCtn().  condor_tail retrieves it directly from
+        # the execute node without requiring a shared filesystem.
         log_filename = (
             f"{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
         )
-        log_file_real = os.path.realpath(os.path.join(datarootfolder, log_filename))
 
-        # After resolving symlinks, the file must live *inside* the data root
-        # (not equal to it and not outside it).
-        if not log_file_real.startswith(dataroot_real + os.sep):
-            logging.error(f"GetLogs: path traversal attempt blocked: {log_filename!r}")
-            return "", 400
+        opts = req.get("Opts", {})
+        raw_tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
+        tail = raw_tail if isinstance(raw_tail, int) and raw_tail > 0 else 0
 
-        logging.info(f"GetLogs: reading {log_file_real}")
-        try:
-            with open(log_file_real, "r", errors="replace") as fh:
-                content = fh.read()
-            opts = req.get("Opts", {})
-            raw_tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
-            tail = raw_tail if isinstance(raw_tail, int) and raw_tail > 0 else 0
-            if tail > 0:
-                lines = content.splitlines(keepends=True)
-                content = "".join(lines[-tail:])
-            return content, 200, {"Content-Type": "text/plain"}
-        except FileNotFoundError:
-            logging.info(f"GetLogs: log file not found yet: {log_file_real}")
-            return "", 200
+        content = None
+
+        # --- Try condor_tail first (no shared filesystem required) ---
+        jid_file = os.path.join(
+            datarootfolder,
+            f"{parts['PodName']}-{parts['PodUID']}.jid",
+        )
+        if os.path.exists(jid_file):
+            try:
+                with open(jid_file, "r") as fh:
+                    cluster_id = fh.read().strip()
+                if cluster_id.isdigit():
+                    proc_id = f"{cluster_id}.0"
+                    # condor_tail retrieves the file from the execute sandbox via
+                    # the HTCondor networking protocol; works for running jobs and
+                    # recently-completed jobs whose sandbox has not yet been cleaned.
+                    collector = getattr(args, "collector_host", None)
+                    schedd = getattr(args, "schedd_host", None)
+                    if collector and schedd:
+                        cmd = [
+                            "condor_tail",
+                            "-pool",
+                            collector,
+                            "-name",
+                            schedd,
+                            "-maxbytes",
+                            "10485760",
+                            proc_id,
+                            log_filename,
+                        ]
+                    else:
+                        cmd = [
+                            "condor_tail",
+                            "-maxbytes",
+                            "10485760",
+                            proc_id,
+                            log_filename,
+                        ]
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode == 0 and result.stdout:
+                        content = result.stdout
+                        logging.info(
+                            "GetLogs: retrieved via condor_tail for"
+                            f" {proc_id} {log_filename}"
+                        )
+                    else:
+                        logging.info(
+                            f"GetLogs: condor_tail returned rc={result.returncode}"
+                            f" ({result.stderr.strip()!r}), falling back to file"
+                        )
+            except Exception as e:
+                logging.info(f"GetLogs: condor_tail failed ({e}), falling back to file")
+
+        # --- Fall back to the HTCondor-transferred copy in the data root ---
+        # After the job completes, HTCondor transfers the sandbox file back to
+        # InitialDir (abs_dataroot) via the standard file-transfer mechanism.
+        if content is None:
+            log_file_real = os.path.realpath(os.path.join(datarootfolder, log_filename))
+            # After resolving symlinks, the file must live *inside* the data root
+            # (not equal to it and not outside it).
+            if not log_file_real.startswith(dataroot_real + os.sep):
+                logging.error(
+                    f"GetLogs: path traversal attempt blocked: {log_filename!r}"
+                )
+                return "", 400
+            logging.info(f"GetLogs: reading transferred file {log_file_real}")
+            try:
+                with open(log_file_real, "r", errors="replace") as fh:
+                    content = fh.read()
+            except FileNotFoundError:
+                logging.info(f"GetLogs: log file not found yet: {log_file_real}")
+                return "", 200
+
+        if tail > 0 and content:
+            lines = content.splitlines(keepends=True)
+            content = "".join(lines[-tail:])
+        return content or "", 200, {"Content-Type": "text/plain"}
 
     except Exception as e:
         logging.error(f"Error in LogsHandler: {e}")
