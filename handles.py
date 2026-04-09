@@ -146,7 +146,9 @@ def prepare_env_file(container, metadata, container_standalone=None):
     keys from the referenced Secrets / ConfigMaps are also injected.
     """
     env_file_name = f"{metadata['name']}-{metadata['uid']}_env.env"
-    env_file_path = os.path.join(InterLinkConfigInst["DataRootFolder"], env_file_name)
+    job_dir = os.path.join(os.path.realpath(InterLinkConfigInst["DataRootFolder"]), f"{metadata['name']}-{metadata['uid']}")
+    os.makedirs(job_dir, exist_ok=True)
+    env_file_path = os.path.join(job_dir, env_file_name)
     lines = []
 
     try:
@@ -204,7 +206,7 @@ def prepare_mounts(pod, container_standalone):
         else container_standalone["name"].split("-")
     )
     pod_name_folder = os.path.join(
-        InterLinkConfigInst["DataRootFolder"], "-".join(pod_name[:-1])
+        os.path.realpath(InterLinkConfigInst["DataRootFolder"]), "-".join(pod_name[:-1])
     )
     for c in pod["spec"]["containers"]:
         if c["name"] == container_standalone["name"]:
@@ -269,10 +271,13 @@ def mountConfigMaps(pod, container_standalone):
     container = extract_container(pod, container_standalone)
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         data_root_folder = InterLinkConfigInst["DataRootFolder"]
-        cmd = ["-rf", os.path.join(os.getcwd(), data_root_folder, "configMaps")]
-        shell = subprocess.Popen(
-            ["rm"] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
+        # Clean and recreate per-job configMaps folder
+        job_dir = os.path.join(os.getcwd(), data_root_folder, f"{pod['metadata']['name']}-{pod['metadata']['uid']}")
+        pod_configmaps_root = os.path.join(job_dir, "configMaps")
+        cmd = ["-rf", pod_configmaps_root]
+        shell = subprocess.Popen([
+            "rm",
+        ] + cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         _, err = shell.communicate()
 
         if err:
@@ -289,13 +294,12 @@ def mountConfigMaps(pod, container_standalone):
                     uid = pod["metadata"]["uid"]
                     for cfgMap in cfgMaps:
                         podConfigMapDir = os.path.join(
-                            os.getcwd(),
-                            data_root_folder,
-                            f"{namespace}-{uid}/configMaps/",
+                            job_dir,
+                            "configMaps",
                             vol["name"],
                         )
                         for key in cfgMap["data"].keys():
-                            path = os.path.join(os.getcwd(), podConfigMapDir, key)
+                            path = os.path.join(podConfigMapDir, key)
                             path += f":{mountSpec['mountPath']}/{key}"
                             configMapNamePaths.append(path)
                         cmd = ["-p", podConfigMapDir]
@@ -327,7 +331,9 @@ def mountSecrets(pod, container_standalone):
     container = extract_container(pod, container_standalone)
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         data_root_folder = InterLinkConfigInst["DataRootFolder"]
-        cmd = ["-rf", os.path.join(os.getcwd(), data_root_folder, "secrets")]
+        job_dir = os.path.join(os.getcwd(), data_root_folder, f"{pod['metadata']['name']}-{pod['metadata']['uid']}")
+        pod_secrets_root = os.path.join(job_dir, "secrets")
+        cmd = ["-rf", pod_secrets_root]
         subprocess.run(["rm"] + cmd, check=True)
         for mountSpec in container["volumeMounts"]:
             for vol in pod["spec"]["volumes"]:
@@ -341,9 +347,8 @@ def mountSecrets(pod, container_standalone):
                         namespace = pod["metadata"]["namespace"]
                         uid = pod["metadata"]["uid"]
                         pod_secret_dir = os.path.join(
-                            os.getcwd(),
-                            data_root_folder,
-                            f"{namespace}-{uid}/secrets/",
+                            job_dir,
+                            "secrets",
                             vol["name"],
                         )
                         for key in secret["data"]:
@@ -366,7 +371,8 @@ def mountSecrets(pod, container_standalone):
 def mount_empty_dir(container, pod):
     ed_path = None
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
-        cmd = ["-rf", os.path.join(InterLinkConfigInst["DataRootFolder"], "emptyDirs")]
+        job_dir = os.path.join(os.getcwd(), InterLinkConfigInst["DataRootFolder"], f"{pod['metadata']['namespace']}-{pod['metadata']['uid']}")
+        cmd = ["-rf", os.path.join(job_dir, "emptyDirs")]
         subprocess.run(["rm"] + cmd, check=True)
         for mount_spec in container["volumeMounts"]:
             pod_volume_spec = None
@@ -376,12 +382,9 @@ def mount_empty_dir(container, pod):
                     break
             if pod_volume_spec and "emptyDir" in pod_volume_spec:
                 ed_path = os.path.join(
-                    InterLinkConfigInst["DataRootFolder"],
-                    pod["metadata"]["namespace"]
-                    + "-"
-                    + str(pod["metadata"]["uid"])
-                    + "/emptyDirs/"
-                    + vol["name"],
+                    job_dir,
+                    "emptyDirs",
+                    vol["name"],
                 )
                 cmd = ["-p", ed_path]
                 subprocess.run(["mkdir"] + cmd, check=True)
@@ -618,8 +621,11 @@ def produce_htcondor_singularity_script(
     name = metadata["name"]
     uid = metadata["uid"]
     abs_dataroot = os.path.realpath(datarootfolder)
-    executable_path = os.path.join(abs_dataroot, f"{name}-{uid}.sh")
-    sub_path = os.path.join(abs_dataroot, f"{name}-{uid}.jdl")
+    # Create a unique job directory for all files related to this pod/job
+    job_dir = os.path.join(abs_dataroot, f"{name}-{uid}")
+    os.makedirs(job_dir, exist_ok=True)
+    executable_path = os.path.join(job_dir, f"{name}-{uid}.sh")
+    sub_path = os.path.join(job_dir, f"{name}-{uid}.jdl")
 
     requested_cpus = 0
     requested_memory = 0
@@ -716,10 +722,10 @@ def produce_htcondor_singularity_script(
 
             f.write(script_body)
 
-        # Ensure log/out/err subdirectories exist under the data root so that
+        # Ensure log/out/err subdirectories exist under the job directory so that
         # HTCondor can write the job's Log/Output/Error files there.
         for subdir in ("log", "out", "err"):
-            subdir_path = os.path.join(abs_dataroot, subdir)
+            subdir_path = os.path.join(job_dir, subdir)
             os.makedirs(subdir_path, exist_ok=True)
             os.chmod(subdir_path, 0o1777)
 
@@ -728,10 +734,7 @@ def produce_htcondor_singularity_script(
         )
 
         # Build the list of per-container output files HTCondor should transfer back
-        # from the execute sandbox to InitialDir (abs_dataroot) on the submit node.
-        # These files are created in the sandbox using relative paths by runCtn().
-        # LogsHandler retrieves them via condor_tail (works without shared filesystem);
-        # reading the transferred copy serves as a fallback for completed jobs.
+        # from the execute sandbox to the job directory on the submit node.
         all_ctn_names = [ctn for ctn, _ in (init_container_commands or [])] + [
             ctn for ctn, _ in container_commands
         ]
@@ -746,11 +749,11 @@ def produce_htcondor_singularity_script(
 
         job = f"""
 Executable = {executable_path}
-InitialDir = {abs_dataroot}
+InitialDir = {job_dir}
 
-Log        = {abs_dataroot}/log/mm_mul.$(Cluster).$(Process).log
-Output     = {abs_dataroot}/out/mm_mul.out.$(Cluster).$(Process)
-Error      = {abs_dataroot}/err/mm_mul.err.$(Cluster).$(Process)
+Log        = {job_dir}/log/mm_mul.$(Cluster).$(Process).log
+Output     = {job_dir}/out/mm_mul.out.$(Cluster).$(Process)
+Error      = {job_dir}/err/mm_mul.err.$(Cluster).$(Process)
 
 {transfer_input_line}
 {transfer_output_line}
@@ -878,30 +881,50 @@ def delete_pod(pod):
     uid = pod["metadata"]["uid"]
 
     logging.info(f"Deleting pod {pod['metadata']['name']}")
-    with open(f"{datarootfolder}{name}-{uid}.jid") as f:
+    job_dir = os.path.join(os.path.realpath(datarootfolder), f"{name}-{uid}")
+    jid_path = os.path.join(job_dir, f"{name}-{uid}.jid")
+    with open(jid_path) as f:
         data = f.read()
     jid = int(data.strip())
     process = os.popen(f"condor_rm {jid}")
     preprocessed = process.read()
     process.close()
-    os.remove(f"{datarootfolder}{name}-{uid}.jid")
-    os.remove(f"{datarootfolder}{name}-{uid}.sh")
-    os.remove(f"{datarootfolder}{name}-{uid}.jdl")
-    os.remove(f"{datarootfolder}{name}-{uid}_env.env")
 
-    # Clean up per-container log files transferred back by HTCondor.
-    dataroot_real = os.path.realpath(datarootfolder)
+    # Remove job directory contents
     try:
-        with os.scandir(datarootfolder) as it:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}.jid"))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}.sh"))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}.jdl"))
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(os.path.join(job_dir, f"{name}-{uid}_env.env"))
+    except FileNotFoundError:
+        pass
+
+    # Clean up per-container log files transferred back by HTCondor inside job dir.
+    try:
+        with os.scandir(job_dir) as it:
             for entry in it:
                 if entry.name.startswith(f"{name}-{uid}-") and entry.name.endswith(
                     ".out"
                 ):
-                    # Validate the path stays within the data root.
-                    if os.path.realpath(entry.path).startswith(dataroot_real + os.sep):
-                        os.remove(entry.path)
+                    os.remove(entry.path)
     except OSError as e:
         logging.warning(f"Could not clean up log files for {name}-{uid}: {e}")
+
+    # Optionally remove the job directory if empty
+    try:
+        os.rmdir(job_dir)
+    except OSError:
+        # Directory not empty or other error — leave it in place
+        pass
 
     return preprocessed
 
@@ -911,16 +934,13 @@ def handle_jid(jid, pod):
     name = pod["metadata"]["name"]
     uid = pod["metadata"]["uid"]
 
-    with open(
-        f"{datarootfolder}{name}-{uid}.jid",
-        "w",
-    ) as f:
+    job_dir = os.path.join(os.path.realpath(datarootfolder), f"{name}-{uid}")
+    os.makedirs(job_dir, exist_ok=True)
+    jid_path = os.path.join(job_dir, f"{name}-{uid}.jid")
+    with open(jid_path, "w") as f:
         f.write(str(jid))
     JID.append({"JID": jid, "pod": pod})
-    logging.info(
-        f"Job {jid} submitted successfully",
-        f"{datarootfolder}{name}-{uid}.jid",
-    )
+    logging.info(f"Job {jid} submitted successfully: {jid_path}")
 
 
 def SubmitHandler():
@@ -1206,14 +1226,9 @@ def SubmitHandler():
         logging.info(f"Job submitted with cluster id: {out_jid}")
         handle_jid(out_jid, pod)
 
-        # Verify job submission was successful
-        jid_file = (
-            InterLinkConfigInst["DataRootFolder"]
-            + pod["metadata"]["name"]
-            + "-"
-            + pod["metadata"]["uid"]
-            + ".jid"
-        )
+        # Verify job submission was successful: the JID file should live in the per-job directory
+        job_dir = os.path.join(os.path.realpath(InterLinkConfigInst["DataRootFolder"]), f"{pod['metadata']['name']}-{pod['metadata']['uid']}")
+        jid_file = os.path.join(job_dir, f"{pod['metadata']['name']}-{pod['metadata']['uid']}.jid")
         if not os.path.exists(jid_file):
             raise Exception("JID file was not created")
 
@@ -1307,13 +1322,8 @@ def StatusHandler():
     resp = []
     for req in req_list:
         try:
-            jid_file = (
-                InterLinkConfigInst["DataRootFolder"]
-                + req["metadata"]["name"]
-                + "-"
-                + req["metadata"]["uid"]
-                + ".jid"
-            )
+            job_dir = os.path.join(os.path.realpath(InterLinkConfigInst["DataRootFolder"]), f"{req['metadata']['name']}-{req['metadata']['uid']}")
+            jid_file = os.path.join(job_dir, f"{req['metadata']['name']}-{req['metadata']['uid']}.jid")
             with open(jid_file, "r") as f:
                 jid_job = f.read().strip()
             podname = req["metadata"]["name"]
@@ -1478,13 +1488,11 @@ def LogsHandler():
         content = None
 
         # --- Try condor_tail first (no shared filesystem required) ---
-        jid_file = os.path.join(
-            datarootfolder,
-            f"{parts['PodName']}-{parts['PodUID']}.jid",
-        )
+        job_dir = os.path.join(os.path.realpath(datarootfolder), f"{parts['PodName']}-{parts['PodUID']}")
+        jid_file = os.path.join(job_dir, f"{parts['PodName']}-{parts['PodUID']}.jid")
         # Validate the jid_file path stays within the data root before opening.
         jid_file_real = os.path.realpath(jid_file)
-        if os.path.exists(jid_file) and jid_file_real.startswith(
+        if os.path.exists(jid_file_real) and jid_file_real.startswith(
             dataroot_real + os.sep
         ):
             try:
