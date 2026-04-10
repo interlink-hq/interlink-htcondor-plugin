@@ -19,11 +19,14 @@ RUN pip3 install --no-cache-dir flask pyyaml
 # that HTCondor provides to job processes), create output dirs, and copy plugin
 # files.  Also configure HTCondor to keep /usr/bin on the job PATH so the
 # singularity wrapper is always found at runtime.
+# Move condor_restd off port 8080 (to 9099) so that test containers can bind
+# to port 8080 without conflict.
 COPY handles.py /utils/handles.py
 COPY probes.py /utils/probes.py
 COPY docker/SidecarConfig.yaml /utils/SidecarConfig.yaml
 # hadolint ignore=DL3059
 RUN ln -sf /usr/bin/apptainer /usr/bin/singularity && \
+    sed -i 's/-p 8080/-p 9099/' /usr/local/bin/condor_restd.sh && \
     echo 'STARTER_JOB_ENVIRONMENT = "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin APPTAINER_CACHEDIR=/tmp/apptainer-cache"' \
         > /etc/condor/config.d/99-job-env.conf && \
     touch /utils/condor_config && \

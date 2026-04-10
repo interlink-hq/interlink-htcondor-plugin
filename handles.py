@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import logging
 import math
@@ -134,13 +135,42 @@ def prepare_envs(container):
         return [""]
 
 
+def _ansi_c_quote(val):
+    """Format val as a bash $'...' ANSI-C quoted string.
+
+    Singularity's ``--env-file`` is evaluated as a bash script, so unquoted
+    values with spaces or single quotes cause fatal parse errors.  We use
+    bash ANSI-C quoting (``$'...'``) for every value: it handles single
+    quotes, double quotes, newlines and other special characters safely without
+    introducing extra characters into the value seen by the container.
+    """
+    result = []
+    for char in val:
+        if char == "\\":
+            result.append("\\\\")
+        elif char == "'":
+            result.append("\\'")
+        elif char == "\n":
+            result.append("\\n")
+        elif char == "\r":
+            result.append("\\r")
+        elif char == "\t":
+            result.append("\\t")
+        elif ord(char) < 32:
+            result.append(f"\\x{ord(char):02x}")
+        else:
+            result.append(char)
+    return "$'" + "".join(result) + "'"
+
+
 def prepare_env_file(container, metadata, container_standalone=None):
     """Write an env file for the given container and return (flags, path).
 
-    Singularity's ``--env-file`` reads each line as ``KEY=VALUE`` where the
-    value is taken *literally* (no shell expansion).  We must NOT shell-quote
-    the values here — ``shlex.quote`` would add single-quotes that become part
-    of the literal value seen by the container.
+    Singularity's ``--env-file`` is evaluated as a bash script, so we must
+    quote every value.  We use bash ANSI-C quoting (``$'...'``) via
+    :func:`_ansi_c_quote` — this safely handles single quotes, double quotes,
+    embedded newlines and other special characters without adding extra
+    characters into the value seen by the container.
 
     ``envFrom`` entries (secretRef / configMapRef) are expanded from the
     ``container_standalone`` data supplied by the interLink sidecar so that all
@@ -161,9 +191,7 @@ def prepare_env_file(container, metadata, container_standalone=None):
         for env_var in container.get("env", []):
             name = env_var["name"]
             raw_val = env_var.get("value") or ""
-            # Replace embedded newlines so as not to break the line-based format
-            safe_val = raw_val.replace("\n", "\\n")
-            lines.append(f"{name}={safe_val}")
+            lines.append(f"{name}={_ansi_c_quote(raw_val)}")
 
         # --- envFrom (bulk import from Secret or ConfigMap) ------------------
         if container_standalone is not None:
@@ -175,15 +203,13 @@ def prepare_env_file(container, metadata, container_standalone=None):
                     for secret in secrets_list:
                         if secret.get("metadata", {}).get("name") == ref_name:
                             for k, v in secret.get("data", {}).items():
-                                safe_v = (v or "").replace("\n", "\\n")
-                                lines.append(f"{k}={safe_v}")
+                                lines.append(f"{k}={_ansi_c_quote(v or '')}")
                 elif "configMapRef" in env_from:
                     ref_name = env_from["configMapRef"].get("name", "")
                     for cm in configmaps_list:
                         if cm.get("metadata", {}).get("name") == ref_name:
                             for k, v in cm.get("data", {}).items():
-                                safe_v = (v or "").replace("\n", "\\n")
-                                lines.append(f"{k}={safe_v}")
+                                lines.append(f"{k}={_ansi_c_quote(v or '')}")
 
         # Env vars may include secret values resolved by the interLink sidecar.
         # Writing them to a file is necessary to pass them to the Singularity
@@ -241,7 +267,11 @@ def prepare_mounts(pod, container_standalone):
                             for i, path in enumerate(secrets_paths):
                                 mount_data.append(path)
                         elif "emptyDir" in vol.keys():
-                            path = mount_empty_dir(container, pod)
+                            path = mount_empty_dir(
+                                container, pod,
+                                vol["name"], mount_var["mountPath"],
+                                read_only=mount_var.get("readOnly", False),
+                            )
                             mount_data.append(path)
                         elif "hostPath" in vol.keys():
                             host_path = vol["hostPath"]["path"]
@@ -382,38 +412,30 @@ def mountSecrets(pod, container_standalone):
                         logging.debug("--- Writing Secret files")
                         for k, v in secret["data"].items():
                             full_path = os.path.join(pod_secret_dir, k)
-                            with open(full_path, "w") as f:
-                                f.write(v)
+                            with open(full_path, "wb") as f:
+                                f.write(base64.b64decode(v))
                             os.chmod(full_path, vol["secret"]["defaultMode"])
                             logging.debug(f"--- Written Secret file {full_path}")
     return secret_name_paths
 
 
-def mount_empty_dir(container, pod):
+def mount_empty_dir(container, pod, vol_name, mount_path, read_only=False):
     ed_path = None
     if InterLinkConfigInst["ExportPodData"] and "volumeMounts" in container.keys():
         job_dir = os.path.join(
             os.getcwd(),
             InterLinkConfigInst["DataRootFolder"],
-            f"{pod['metadata']['namespace']}-{pod['metadata']['uid']}",
+            f"{pod['metadata']['name']}-{pod['metadata']['uid']}",
         )
-        cmd = ["-rf", os.path.join(job_dir, "emptyDirs")]
-        subprocess.run(["rm"] + cmd, check=True)
-        for mount_spec in container["volumeMounts"]:
-            pod_volume_spec = None
-            for vol in pod["spec"]["volumes"]:
-                if vol["name"] == mount_spec["name"]:
-                    pod_volume_spec = vol
-                    break
-            if pod_volume_spec and "emptyDir" in pod_volume_spec:
-                ed_path = os.path.join(
-                    job_dir,
-                    "emptyDirs",
-                    vol["name"],
-                )
-                cmd = ["-p", ed_path]
-                subprocess.run(["mkdir"] + cmd, check=True)
-                ed_path += ":" + mount_spec["mountPath"]
+        empty_dirs_root = os.path.join(job_dir, "emptyDirs")
+        os.makedirs(empty_dirs_root, exist_ok=True)
+        os.chmod(empty_dirs_root, 0o1777)
+        ed_path = os.path.join(empty_dirs_root, vol_name)
+        os.makedirs(ed_path, exist_ok=True)
+        os.chmod(ed_path, 0o1777)
+        ed_path += ":" + mount_path
+        if read_only:
+            ed_path += ":ro"
 
     return ed_path
 
@@ -574,13 +596,35 @@ endScript() {
 """
 
 
+def _extract_sandbox_bind_dirs(all_commands):
+    """Return the set of relative (./...) bind-source dirs referenced in any
+    command token list.  These are emptyDir directories that must be pre-created
+    inside the HTCondor execute sandbox — HTCondor does not transfer empty
+    directories, so without an explicit mkdir they will be absent and the bind
+    mount will silently fail, leaving the container path read-only."""
+    dirs = set()
+    for _, tokens in all_commands:
+        for i, tok in enumerate(tokens):
+            if tok == "--bind" and i + 1 < len(tokens):
+                for spec in tokens[i + 1].split(","):
+                    if spec and ":" in spec:
+                        src = spec.split(":")[0]
+                        if src.startswith("./"):
+                            dirs.add(src)
+    return sorted(dirs)
+
+
 def _clean_command_tokens(tokens):
     """Join and clean a list of singularity command tokens into a single string.
 
     Wraps the token that follows a ``-c`` flag with ``shlex.quote`` (so the
     shell does not re-split multi-line scripts, and single-quotes within the
-    script content are safely escaped), then strips empty double-quoted tokens
-    and collapses extra whitespace.
+    script content are safely escaped), then strips empty double-quoted tokens.
+
+    Note: we intentionally do NOT collapse multiple spaces here, because the
+    quoted -c argument may contain Python code with meaningful indentation
+    (multiple spaces).  Extra spaces from empty tokens such as pre_exec="" or
+    singularity_options="" are harmless in a bash command line.
     """
     result = list(tokens)
     for i in range(1, len(result)):
@@ -588,7 +632,6 @@ def _clean_command_tokens(tokens):
             result[i] = shlex.quote(result[i])
     line = " ".join(result)
     line = re.sub(r'\s*""\s*', " ", line)
-    line = re.sub(r" {2,}", " ", line)
     return line.strip()
 
 
@@ -714,6 +757,14 @@ def produce_htcondor_singularity_script(
             # ---- probe background sub-shells ----------------------------
             for ps in probe_scripts:
                 script_body += "\n" + ps + "\n"
+
+            # ---- pre-create emptyDir sandbox dirs (HTCondor skips empty dirs) -
+            all_cmds = list(init_container_commands or []) + list(container_commands)
+            sandbox_dirs = _extract_sandbox_bind_dirs(all_cmds)
+            if sandbox_dirs:
+                script_body += "\n# Pre-create emptyDir bind-source dirs in sandbox\n"
+                for d in sandbox_dirs:
+                    script_body += f"mkdir -p {shlex.quote(d)} && chmod 1777 {shlex.quote(d)}\n"
 
             # ---- init containers: run sequentially to completion ---------
             if init_container_commands:
@@ -1072,17 +1123,18 @@ def SubmitHandler():
             for mount in (mounts[-1].split(","))[:-1]:
                 if not mount or ":" not in mount:
                     continue
+                parts = mount.split(":")
                 if "/cvmfs" not in mount:
                     prefix_ = "./"
                 else:
                     prefix_ = "/"
-                local_mounts[1] += (
-                    prefix_
-                    + (mount.split(":")[0]).split("/")[-1]
-                    + ":"
-                    + mount.split(":")[1]
-                    + ","
-                )
+                local_src = prefix_ + parts[0].split("/")[-1]
+                local_dst = parts[1]
+                mount_opts = parts[2] if len(parts) > 2 else None
+                if mount_opts:
+                    local_mounts[1] += f"{local_src}:{local_dst}:{mount_opts},"
+                else:
+                    local_mounts[1] += f"{local_src}:{local_dst},"
             if local_mounts[-1] == "":
                 local_mounts = [""]
             if "command" in container and "args" in container:
@@ -1117,8 +1169,16 @@ def SubmitHandler():
                     + container["args"]
                 )
             else:
+                # No command and no args: use singularity run to invoke the
+                # image's default ENTRYPOINT/CMD.  singularity exec without an
+                # explicit command is not valid and would fail immediately.
                 singularity_command = (
-                    [pre_exec] + commstr1 + env_flags + local_mounts + [image]
+                    [pre_exec]
+                    + ["singularity", "run"]
+                    + [singularity_options]
+                    + env_flags
+                    + local_mounts
+                    + [image]
                 )
             init_container_commands.append((container["name"], singularity_command))
 
@@ -1183,17 +1243,18 @@ def SubmitHandler():
             for mount in (mounts[-1].split(","))[:-1]:
                 if not mount or ":" not in mount:
                     continue
+                parts = mount.split(":")
                 if "/cvmfs" not in mount:
                     prefix_ = "./"
                 else:
                     prefix_ = "/"
-                local_mounts[1] += (
-                    prefix_
-                    + (mount.split(":")[0]).split("/")[-1]
-                    + ":"
-                    + mount.split(":")[1]
-                    + ","
-                )
+                local_src = prefix_ + parts[0].split("/")[-1]
+                local_dst = parts[1]
+                mount_opts = parts[2] if len(parts) > 2 else None
+                if mount_opts:
+                    local_mounts[1] += f"{local_src}:{local_dst}:{mount_opts},"
+                else:
+                    local_mounts[1] += f"{local_src}:{local_dst},"
             if local_mounts[-1] == "":
                 local_mounts = [""]
 
@@ -1233,8 +1294,16 @@ def SubmitHandler():
                     + container["args"]
                 )
             else:
+                # No command and no args: use singularity run to invoke the
+                # image's default ENTRYPOINT/CMD.  singularity exec without an
+                # explicit command is not valid and would fail immediately.
                 singularity_command = (
-                    [pre_exec] + commstr1 + env_flags + local_mounts + [image]
+                    [pre_exec]
+                    + ["singularity", "run"]
+                    + [singularity_options]
+                    + env_flags
+                    + local_mounts
+                    + [image]
                 )
             # Collect as (name, tokens) for runCtn pattern
             container_commands.append((container["name"], singularity_command))
