@@ -239,7 +239,10 @@ def prepare_mounts(pod, container_standalone):
     pod_name_folder = os.path.join(
         os.path.realpath(InterLinkConfigInst["DataRootFolder"]), "-".join(pod_name[:-1])
     )
-    for c in pod["spec"]["containers"]:
+    all_containers = list(pod["spec"]["containers"]) + list(
+        pod["spec"].get("initContainers", [])
+    )
+    for c in all_containers:
         if c["name"] == container_standalone["name"]:
             container = c
             try:
@@ -596,12 +599,20 @@ endScript() {
 """
 
 
-def _extract_sandbox_bind_dirs(all_commands):
+def _extract_sandbox_bind_dirs(all_commands, input_files=None):
     """Return the set of relative (./...) bind-source dirs referenced in any
     command token list.  These are emptyDir directories that must be pre-created
     inside the HTCondor execute sandbox — HTCondor does not transfer empty
     directories, so without an explicit mkdir they will be absent and the bind
-    mount will silently fail, leaving the container path read-only."""
+    mount will silently fail, leaving the container path read-only.
+
+    ConfigMap and Secret sources are FILES that HTCondor transfers via
+    transfer_input_files — they must NOT be pre-created as directories.
+    We exclude any ./name whose basename matches a file in input_files."""
+    transferred_basenames = set()
+    if input_files:
+        for f in input_files:
+            transferred_basenames.add(os.path.basename(f))
     dirs = set()
     for _, tokens in all_commands:
         for i, tok in enumerate(tokens):
@@ -610,7 +621,9 @@ def _extract_sandbox_bind_dirs(all_commands):
                     if spec and ":" in spec:
                         src = spec.split(":")[0]
                         if src.startswith("./"):
-                            dirs.add(src)
+                            basename = src[2:]  # strip "./"
+                            if basename not in transferred_basenames:
+                                dirs.add(src)
     return sorted(dirs)
 
 
@@ -760,7 +773,7 @@ def produce_htcondor_singularity_script(
 
             # ---- pre-create emptyDir sandbox dirs (HTCondor skips empty dirs) -
             all_cmds = list(init_container_commands or []) + list(container_commands)
-            sandbox_dirs = _extract_sandbox_bind_dirs(all_cmds)
+            sandbox_dirs = _extract_sandbox_bind_dirs(all_cmds, input_files)
             if sandbox_dirs:
                 script_body += "\n# Pre-create emptyDir bind-source dirs in sandbox\n"
                 for d in sandbox_dirs:
