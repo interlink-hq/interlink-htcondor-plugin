@@ -567,6 +567,11 @@ class TestCleanCommandTokens:
         result = handles._clean_command_tokens(["a", "", "b"])
         assert "  " not in result
 
+    def test_literal_empty_string_inside_c_script_is_preserved(self):
+        script = 'python - <<\'EOF\'\nprint(("", 8080))\nEOF'
+        result = handles._clean_command_tokens(["sh", "-c", script])
+        assert '("", 8080)' in result
+
 
 # ---------------------------------------------------------------------------
 # API compatibility tests — interlink 0.6.1
@@ -745,6 +750,48 @@ class TestStatusHandlerMultiPod:
         assert len(statuses) == 1
         assert statuses[0]["name"] == "pod-a"
 
+
+class TestLogsHandler:
+    def test_getlogs_uses_sandbox_filename_for_condor_tail(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+
+        job_dir = tmp_path / "pod-a-uid-a"
+        job_dir.mkdir()
+        (job_dir / "pod-a-uid-a.jid").write_text("100")
+
+        seen = {}
+
+        def fake_run(cmd, capture_output, text, timeout):
+            seen["cmd"] = cmd
+
+            class Result:
+                returncode = 1
+                stdout = "probe log line\n"
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setattr(handles.subprocess, "run", fake_run)
+
+        resp = _flask_test_client().get(
+            "/getLogs",
+            data=_json.dumps(
+                {
+                    "PodName": "pod-a",
+                    "PodUID": "uid-a",
+                    "ContainerName": "main",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 200
+        assert resp.data.decode() == "probe log line\n"
+        assert seen["cmd"][-1] == "pod-a-uid-a-main.out"
 
 class TestSystemInfoEndpoint:
     """/system-info must return JSON with status and htcondor_connected fields."""

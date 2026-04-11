@@ -632,19 +632,18 @@ def _clean_command_tokens(tokens):
 
     Wraps the token that follows a ``-c`` flag with ``shlex.quote`` (so the
     shell does not re-split multi-line scripts, and single-quotes within the
-    script content are safely escaped), then strips empty double-quoted tokens.
+    script content are safely escaped), then strips only standalone empty tokens.
 
     Note: we intentionally do NOT collapse multiple spaces here, because the
     quoted -c argument may contain Python code with meaningful indentation
     (multiple spaces).  Extra spaces from empty tokens such as pre_exec="" or
     singularity_options="" are harmless in a bash command line.
     """
-    result = list(tokens)
+    result = [token for token in tokens if token not in ("", '""')]
     for i in range(1, len(result)):
         if result[i - 1] == "-c":
             result[i] = shlex.quote(result[i])
     line = " ".join(result)
-    line = re.sub(r'\s*""\s*', " ", line)
     return line.strip()
 
 
@@ -1605,9 +1604,13 @@ def LogsHandler():
                 return "", 400
 
         # The per-container output file is written to the HTCondor execute sandbox
-        # as a relative path by runCtn().  condor_tail retrieves it directly from
-        # the execute node without requiring a shared filesystem.
-        log_filename = f"{job_dir}/{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
+        # as a relative path by runCtn().  condor_tail must therefore use the
+        # sandbox filename, while the post-transfer fallback reads the copy under
+        # the per-job directory in the data root.
+        sandbox_log_filename = (
+            f"{parts['PodName']}-{parts['PodUID']}-{parts['ContainerName']}.out"
+        )
+        transferred_log_path = os.path.join(job_dir, sandbox_log_filename)
 
         opts = req.get("Opts", {})
         raw_tail = opts.get("Tail", 0) if isinstance(opts, dict) else 0
@@ -1646,7 +1649,7 @@ def LogsHandler():
                             "-maxbytes",
                             str(_CONDOR_TAIL_MAX_BYTES),
                             proc_id,
-                            log_filename,
+                            sandbox_log_filename,
                         ]
                     else:
                         cmd = [
@@ -1654,16 +1657,16 @@ def LogsHandler():
                             "-maxbytes",
                             str(_CONDOR_TAIL_MAX_BYTES),
                             proc_id,
-                            log_filename,
+                            sandbox_log_filename,
                         ]
                     result = subprocess.run(
                         cmd, capture_output=True, text=True, timeout=60
                     )
-                    if result.returncode == 0 and result.stdout:
+                    if result.stdout:
                         content = result.stdout
                         logging.info(
                             "GetLogs: retrieved via condor_tail for"
-                            f" {proc_id} {log_filename}"
+                            f" {proc_id} {sandbox_log_filename}"
                         )
                     else:
                         logging.info(
@@ -1681,12 +1684,12 @@ def LogsHandler():
         # After the job completes, HTCondor transfers the sandbox file back to
         # InitialDir (abs_dataroot) via the standard file-transfer mechanism.
         if content is None:
-            log_file_real = os.path.realpath(os.path.join(datarootfolder, log_filename))
+            log_file_real = os.path.realpath(transferred_log_path)
             # After resolving symlinks, the file must live *inside* the data root
             # (not equal to it and not outside it).
             if not log_file_real.startswith(dataroot_real + os.sep):
                 logging.error(
-                    f"GetLogs: path traversal attempt blocked: {log_filename!r}"
+                    f"GetLogs: path traversal attempt blocked: {transferred_log_path!r}"
                 )
                 return "", 400
             logging.info(f"GetLogs: reading transferred file {log_file_real}")
