@@ -192,9 +192,8 @@ class TestPrepareProbesAnnotations:
 
     def test_custom_singularity_path_from_config(self):
         orig = handles.InterLinkConfigInst.get("SingularityPath")
-        handles.InterLinkConfigInst["SingularityPath"] = (
-            "/opt/singularity/bin/singularity"
-        )
+        singularity_path = "/opt/singularity/bin/singularity"
+        handles.InterLinkConfigInst["SingularityPath"] = singularity_path
         try:
             container = _container(livenessProbe={"exec": {"command": ["true"]}})
             probe_script, _ = prepare_probes(container, _BASE_METADATA)
