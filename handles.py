@@ -11,7 +11,6 @@ from datetime import datetime
 
 import yaml
 from flask import Flask, jsonify, request
-
 from probes import (
     generate_probe_cleanup_script,
     generate_probe_script,
