@@ -48,35 +48,38 @@ WORKDIR /utils
 # Docker layer cache remains valid across plugin code changes.
 # Pulled SIF files are removed afterwards; only the OCI blob cache in
 # APPTAINER_CACHEDIR is retained for use by HTCondor jobs.
+# Cache directories are set to 1777 so the condor user can create new entries
+# at job runtime (e.g. for images not pre-warmed here).
 # hadolint ignore=DL3059
 RUN mkdir -p /tmp/apptainer-cache /tmp/apptainer-prewarm && \
     chmod 1777 /tmp/apptainer-cache && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/cowsay.sif \
-        docker://ghcr.io/grycap/cowsay 2>&1 | tail -3 || true && \
+        docker://ghcr.io/grycap/cowsay || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/python-alpine.sif \
-        docker://python:alpine 2>&1 | tail -3 || true && \
+        docker://python:alpine || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/python311-alpine.sif \
-        docker://python:3.11-alpine 2>&1 | tail -3 || true && \
+        docker://python:3.11-alpine || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/alpine319.sif \
-        docker://alpine:3.19 2>&1 | tail -3 || true && \
+        docker://alpine:3.19 || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/busybox-latest.sif \
-        docker://busybox:latest 2>&1 | tail -3 || true && \
+        docker://busybox:latest || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/busybox136.sif \
-        docker://busybox:1.36 2>&1 | tail -3 || true && \
+        docker://busybox:1.36 || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/nginx-alpine.sif \
-        docker://nginx:alpine 2>&1 | tail -3 || true && \
+        docker://nginx:alpine || true && \
     APPTAINER_CACHEDIR=/tmp/apptainer-cache APPTAINER_TMPDIR=/tmp/apptainer-prewarm \
     apptainer pull /tmp/apptainer-prewarm/bitnami-git.sif \
-        docker://bitnamilegacy/git 2>&1 | tail -3 || true && \
+        docker://bitnamilegacy/git || true && \
     rm -rf /tmp/apptainer-prewarm && \
-    chmod -R a+rX /tmp/apptainer-cache
+    find /tmp/apptainer-cache -type d -exec chmod 1777 {} + && \
+    find /tmp/apptainer-cache -type f -exec chmod 644 {} +
 
 # Copy plugin files (after cache-prewarm so Docker layer cache survives code changes)
 COPY handles.py /utils/handles.py
