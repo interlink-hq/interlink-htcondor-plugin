@@ -11,12 +11,12 @@ from datetime import datetime
 
 import yaml
 from flask import Flask, jsonify, request
+
 from probes import (
     generate_probe_cleanup_script,
     generate_probe_script,
     translate_kubernetes_probes,
 )
-
 
 parser = argparse.ArgumentParser()
 
@@ -147,7 +147,7 @@ def _wrap_command_with_env(command_tokens, env_file_name):
     return [
         "/bin/sh",
         "-c",
-        f". ./{env_file_name} && exec \"$@\"",
+        f'. ./{env_file_name} && exec "$@"',
         "sh",
     ] + command_tokens
 
@@ -261,8 +261,10 @@ def prepare_mounts(pod, container_standalone):
                                 mount_data.append(path)
                         elif "emptyDir" in vol.keys():
                             path = mount_empty_dir(
-                                container, pod,
-                                vol["name"], mount_var["mountPath"],
+                                container,
+                                pod,
+                                vol["name"],
+                                mount_var["mountPath"],
                                 read_only=mount_var.get("readOnly", False),
                             )
                             mount_data.append(path)
@@ -330,8 +332,6 @@ def mountConfigMaps(pod, container_standalone):
                 if "configMap" in vol.keys():
                     print("container_standalone:", container_standalone)
                     cfgMaps = container_standalone["configMaps"]
-                    namespace = pod["metadata"]["namespace"]
-                    uid = pod["metadata"]["uid"]
                     for cfgMap in cfgMaps:
                         podConfigMapDir = os.path.join(
                             job_dir,
@@ -388,8 +388,6 @@ def mountSecrets(pod, container_standalone):
                     for secret in secrets:
                         if secret["metadata"]["name"] != vol["secret"]["secretName"]:
                             continue
-                        namespace = pod["metadata"]["namespace"]
-                        uid = pod["metadata"]["uid"]
                         pod_secret_dir = os.path.join(
                             job_dir,
                             "secrets",
@@ -766,7 +764,9 @@ def produce_htcondor_singularity_script(
             if sandbox_dirs:
                 script_body += "\n# Pre-create emptyDir bind-source dirs in sandbox\n"
                 for d in sandbox_dirs:
-                    script_body += f"mkdir -p {shlex.quote(d)} && chmod 1777 {shlex.quote(d)}\n"
+                    script_body += (
+                        f"mkdir -p {shlex.quote(d)} && chmod 1777 {shlex.quote(d)}\n"
+                    )
 
             # ---- init containers: run sequentially to completion ---------
             if init_container_commands:
@@ -800,9 +800,7 @@ def produce_htcondor_singularity_script(
             script_body += "\nwaitCtns\nendScript\n"
 
             f.write(script_body)
-        logging.info(
-            "Generated job script for %s-%s at %s", name, uid, executable_path
-        )
+        logging.info("Generated job script for %s-%s at %s", name, uid, executable_path)
         logging.debug("Job script content:\n%s", script_body)
 
         # Ensure log/out/err subdirectories exist under the job directory so that
@@ -1106,9 +1104,7 @@ def SubmitHandler():
             env_file_name, env_path = prepare_env_file(
                 container, metadata, container_standalone
             )
-            env_flags = (
-                ["--env-file", f"./{env_file_name}"] if env_file_name else []
-            )
+            env_flags = ["--env-file", f"./{env_file_name}"] if env_file_name else []
             if container["image"].startswith("/cvmfs") or container["image"].startswith(
                 "docker://"
             ):
@@ -1220,9 +1216,7 @@ def SubmitHandler():
             env_file_name, env_path = prepare_env_file(
                 container, metadata, container_standalone
             )
-            env_flags = (
-                ["--env-file", f"./{env_file_name}"] if env_file_name else []
-            )
+            env_flags = ["--env-file", f"./{env_file_name}"] if env_file_name else []
             # if container["image"].startswith("/") or ".io" in container["image"]:
             # if container["image"].startswith("/") or "://" in container["image"]:
             #    image_uri = metadata.get("Annotations", {}).get(
@@ -1347,7 +1341,7 @@ def SubmitHandler():
         logging.info(f"Job submitted with cluster id: {out_jid}")
         handle_jid(out_jid, pod)
 
-        # Verify job submission was successful: the JID file should live in the per-job directory
+        # Verify job submission: the JID file must live in the per-job directory
         job_dir = os.path.join(
             os.path.realpath(InterLinkConfigInst["DataRootFolder"]),
             f"{pod['metadata']['name']}-{pod['metadata']['uid']}",

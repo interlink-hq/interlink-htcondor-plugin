@@ -192,9 +192,9 @@ class TestPrepareProbesAnnotations:
 
     def test_custom_singularity_path_from_config(self):
         orig = handles.InterLinkConfigInst.get("SingularityPath")
-        handles.InterLinkConfigInst[
-            "SingularityPath"
-        ] = "/opt/singularity/bin/singularity"
+        handles.InterLinkConfigInst["SingularityPath"] = (
+            "/opt/singularity/bin/singularity"
+        )
         try:
             container = _container(livenessProbe={"exec": {"command": ["true"]}})
             probe_script, _ = prepare_probes(container, _BASE_METADATA)
@@ -571,7 +571,7 @@ class TestCleanCommandTokens:
         assert "  " not in result
 
     def test_literal_empty_string_inside_c_script_is_preserved(self):
-        script = 'python - <<\'EOF\'\nprint(("", 8080))\nEOF'
+        script = "python - <<'EOF'\nprint((\"\", 8080))\nEOF"
         result = handles._clean_command_tokens(["sh", "-c", script])
         assert '("", 8080)' in result
 
@@ -599,7 +599,9 @@ class TestPrepareEnvFile:
         assert "export SINGLE_QUOTES='It'\"'\"'s working'" in content
 
     def test_wrap_command_with_env_injects_shell_wrapper(self):
-        wrapped = handles._wrap_command_with_env(["python", "-c", "print('ok')"], "env.env")
+        wrapped = handles._wrap_command_with_env(
+            ["python", "-c", "print('ok')"], "env.env"
+        )
         assert wrapped[:4] == ["/bin/sh", "-c", '. ./env.env && exec "$@"', "sh"]
         assert wrapped[4:] == ["python", "-c", "print('ok')"]
 
@@ -823,6 +825,7 @@ class TestLogsHandler:
         assert resp.status_code == 200
         assert resp.data.decode() == "probe log line\n"
         assert seen["cmd"][-1] == "pod-a-uid-a-main.out"
+
 
 class TestSystemInfoEndpoint:
     """/system-info must return JSON with status and htcondor_connected fields."""
