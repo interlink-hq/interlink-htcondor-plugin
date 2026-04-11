@@ -573,6 +573,34 @@ class TestCleanCommandTokens:
         assert '("", 8080)' in result
 
 
+class TestPrepareEnvFile:
+    def test_prepare_env_file_writes_export_lines(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        env_file_name, env_path = handles.prepare_env_file(
+            {
+                "name": "c1",
+                "env": [
+                    {"name": "BACKTICKS", "value": "Run `command` here"},
+                    {"name": "SINGLE_QUOTES", "value": "It's working"},
+                ],
+            },
+            {"name": "pod-a", "uid": "uid-a"},
+        )
+        assert env_file_name == "pod-a-uid-a_env.env"
+        content = open(env_path).read()
+        assert "export BACKTICKS='Run `command` here'" in content
+        assert "export SINGLE_QUOTES='It'\"'\"'s working'" in content
+
+    def test_wrap_command_with_env_injects_shell_wrapper(self):
+        wrapped = handles._wrap_command_with_env(["python", "-c", "print('ok')"], "env.env")
+        assert wrapped[:4] == ["/bin/sh", "-c", '. ./env.env && exec "$@"', "sh"]
+        assert wrapped[4:] == ["python", "-c", "print('ok')"]
+
+
 # ---------------------------------------------------------------------------
 # API compatibility tests — interlink 0.6.1
 # ---------------------------------------------------------------------------

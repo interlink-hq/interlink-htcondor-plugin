@@ -135,42 +135,29 @@ def prepare_envs(container):
         return [""]
 
 
-def _ansi_c_quote(val):
-    """Format val as a bash $'...' ANSI-C quoted string.
+def _shell_single_quote(val):
+    """Format *val* as a POSIX shell single-quoted string."""
+    return "'" + str(val).replace("'", "'\"'\"'") + "'"
 
-    Singularity's ``--env-file`` is evaluated as a bash script, so unquoted
-    values with spaces or single quotes cause fatal parse errors.  We use
-    bash ANSI-C quoting (``$'...'``) for every value: it handles single
-    quotes, double quotes, newlines and other special characters safely without
-    introducing extra characters into the value seen by the container.
-    """
-    result = []
-    for char in val:
-        if char == "\\":
-            result.append("\\\\")
-        elif char == "'":
-            result.append("\\'")
-        elif char == "\n":
-            result.append("\\n")
-        elif char == "\r":
-            result.append("\\r")
-        elif char == "\t":
-            result.append("\\t")
-        elif ord(char) < 32:
-            result.append(f"\\x{ord(char):02x}")
-        else:
-            result.append(char)
-    return "$'" + "".join(result) + "'"
+
+def _wrap_command_with_env(command_tokens, env_file_name):
+    """Source the generated env file inside the container, then exec the command."""
+    if not env_file_name:
+        return command_tokens
+    return [
+        "/bin/sh",
+        "-c",
+        f". ./{env_file_name} && exec \"$@\"",
+        "sh",
+    ] + command_tokens
 
 
 def prepare_env_file(container, metadata, container_standalone=None):
-    """Write an env file for the given container and return (flags, path).
+    """Write a sourceable env script for the given container and return its path.
 
-    Singularity's ``--env-file`` is evaluated as a bash script, so we must
-    quote every value.  We use bash ANSI-C quoting (``$'...'``) via
-    :func:`_ansi_c_quote` — this safely handles single quotes, double quotes,
-    embedded newlines and other special characters without adding extra
-    characters into the value seen by the container.
+    The file contains ``export`` statements and is sourced inside the container
+    command wrapper instead of being passed via ``--env-file``. This avoids
+    Apptainer re-parsing values like backticks or backslash-escaped quotes.
 
     ``envFrom`` entries (secretRef / configMapRef) are expanded from the
     ``container_standalone`` data supplied by the interLink sidecar so that all
@@ -191,7 +178,7 @@ def prepare_env_file(container, metadata, container_standalone=None):
         for env_var in container.get("env", []):
             name = env_var["name"]
             raw_val = env_var.get("value") or ""
-            lines.append(f"{name}={_ansi_c_quote(raw_val)}")
+            lines.append(f"export {name}={_shell_single_quote(raw_val)}")
 
         # --- envFrom (bulk import from Secret or ConfigMap) ------------------
         if container_standalone is not None:
@@ -203,29 +190,32 @@ def prepare_env_file(container, metadata, container_standalone=None):
                     for secret in secrets_list:
                         if secret.get("metadata", {}).get("name") == ref_name:
                             for k, v in secret.get("data", {}).items():
-                                lines.append(f"{k}={_ansi_c_quote(v or '')}")
+                                lines.append(
+                                    f"export {k}={_shell_single_quote(v or '')}"
+                                )
                 elif "configMapRef" in env_from:
                     ref_name = env_from["configMapRef"].get("name", "")
                     for cm in configmaps_list:
                         if cm.get("metadata", {}).get("name") == ref_name:
                             for k, v in cm.get("data", {}).items():
-                                lines.append(f"{k}={_ansi_c_quote(v or '')}")
+                                lines.append(
+                                    f"export {k}={_shell_single_quote(v or '')}"
+                                )
 
         # Env vars may include secret values resolved by the interLink sidecar.
-        # Writing them to a file is necessary to pass them to the Singularity
-        # container via --env-file.  Use mode 0o644 (readable by all) since
-        # HTCondor's condor_shadow must be able to read and transfer this file
-        # to the execute node.
+        # Write them to a sourceable file and transfer it into the execute
+        # sandbox; the generated container wrapper sources it inside the
+        # container before exec'ing the real command.
         with open(env_file_path, "w") as fp:
             fp.write("\n".join(lines) + "\n")
         os.chmod(env_file_path, 0o644)
         logging.info(f"Wrote env file to {env_file_path}")
 
-        return (["--env-file", env_file_name], env_file_path)
+        return (env_file_name, env_file_path)
 
     except Exception as e:
         logging.error(f"Failed to write env file: {e}")
-        return ([], None)
+        return (None, None)
 
 
 def prepare_mounts(pod, container_standalone):
@@ -1113,7 +1103,7 @@ def SubmitHandler():
                         container_standalone = c
                         mounts = prepare_mounts(pod, container_standalone)
                         break
-            env_flags, env_path = prepare_env_file(
+            env_file_name, env_path = prepare_env_file(
                 container, metadata, container_standalone
             )
             if container["image"].startswith("/cvmfs") or container["image"].startswith(
@@ -1150,35 +1140,40 @@ def SubmitHandler():
             if local_mounts[-1] == "":
                 local_mounts = [""]
             if "command" in container and "args" in container:
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"] + container["args"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["command"]
-                    + container["args"]
+                    + container_entrypoint
                 )
             elif "command" in container:
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["command"]
+                    + container_entrypoint
                 )
             elif "args" in container:
+                container_entrypoint = _wrap_command_with_env(
+                    container["args"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["args"]
+                    + container_entrypoint
                 )
             else:
                 # No command and no args: use singularity run to invoke the
@@ -1219,7 +1214,7 @@ def SubmitHandler():
                         mounts = prepare_mounts(pod, container_standalone)
                         break
             # envs = prepare_envs(container)
-            env_flags, env_path = prepare_env_file(
+            env_file_name, env_path = prepare_env_file(
                 container, metadata, container_standalone
             )
             # if container["image"].startswith("/") or ".io" in container["image"]:
@@ -1275,35 +1270,40 @@ def SubmitHandler():
             cleanup_scripts.append(cleanup_script)
 
             if "command" in container.keys() and "args" in container.keys():
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"] + container["args"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["command"]
-                    + container["args"]
+                    + container_entrypoint
                 )
             elif "command" in container.keys():
+                container_entrypoint = _wrap_command_with_env(
+                    container["command"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["command"]
+                    + container_entrypoint
                 )
             elif "args" in container.keys():
+                container_entrypoint = _wrap_command_with_env(
+                    container["args"], env_file_name
+                )
                 singularity_command = (
                     [pre_exec]
                     + commstr1
                     + [singularity_options]
-                    + env_flags
                     + local_mounts
                     + [image]
-                    + container["args"]
+                    + container_entrypoint
                 )
             else:
                 # No command and no args: use singularity run to invoke the
