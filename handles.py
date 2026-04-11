@@ -1106,6 +1106,9 @@ def SubmitHandler():
             env_file_name, env_path = prepare_env_file(
                 container, metadata, container_standalone
             )
+            env_flags = (
+                ["--env-file", f"./{env_file_name}"] if env_file_name else []
+            )
             if container["image"].startswith("/cvmfs") or container["image"].startswith(
                 "docker://"
             ):
@@ -1216,6 +1219,9 @@ def SubmitHandler():
             # envs = prepare_envs(container)
             env_file_name, env_path = prepare_env_file(
                 container, metadata, container_standalone
+            )
+            env_flags = (
+                ["--env-file", f"./{env_file_name}"] if env_file_name else []
             )
             # if container["image"].startswith("/") or ".io" in container["image"]:
             # if container["image"].startswith("/") or "://" in container["image"]:

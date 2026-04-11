@@ -302,8 +302,10 @@ def _make_script(
                 handles.InterLinkConfigInst["DataRootFolder"] = orig_dr
             os.chdir(orig_dir)
 
-        # Read the generated .sh file
-        sh_path = os.path.join(tmpdir, f"{metadata['name']}-{metadata['uid']}.sh")
+        # Read the generated .sh file — produce_htcondor_singularity_script
+        # places it in a per-pod subdirectory: {name}-{uid}/{name}-{uid}.sh
+        job_dir = os.path.join(tmpdir, f"{metadata['name']}-{metadata['uid']}")
+        sh_path = os.path.join(job_dir, f"{metadata['name']}-{metadata['uid']}.sh")
         with open(sh_path) as fh:
             return fh.read()
 
@@ -482,14 +484,15 @@ class TestRunCtnMultiContainer:
 
 
 class TestRunCtnOutputRedirection:
-    """runCtn redirects output to workingPath/run-<name>.out."""
+    """runCtn redirects output to a per-container .out file."""
 
     def test_runctn_body_redirects_to_workingpath(self):
         script = _make_script(
             _ONE_CONTAINER,
             [("c1", ["singularity", "exec", "docker://busybox:latest"])],
         )
-        assert '"${workingPath}/run-${ctn}.out"' in script
+        # Output is written to {podname}-{poduid}-{ctn}.out in the sandbox
+        assert '"${_IL_POD_NAME}-${_IL_POD_UID}-${ctn}.out"' in script
 
     def test_background_ampersand_in_runctn(self):
         script = _make_script(

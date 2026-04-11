@@ -33,8 +33,8 @@ RUN ln -sf /usr/bin/apptainer /usr/bin/singularity && \
     sed -i 's/-p 8080/-p 9099/' /usr/local/bin/condor_restd.sh && \
     echo 'STARTER_JOB_ENVIRONMENT = "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin APPTAINER_CACHEDIR=/tmp/apptainer-cache"' \
         > /etc/condor/config.d/99-job-env.conf && \
-    touch /utils/condor_config && \
     mkdir -p /utils/.interlink /utils/out /utils/err /utils/log && \
+    touch /utils/condor_config && \
     chmod 1777 /utils/.interlink /utils/out /utils/err /utils/log && \
     echo "condor:100000:65536" >> /etc/subuid && \
     echo "condor:100000:65536" >> /etc/subgid
