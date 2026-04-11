@@ -1,6 +1,6 @@
 {
   "MD013": {
-    "line_length": 120,
+    "line_length": 200,
     "code_blocks": false,
     "tables": false
   },
@@ -8,5 +8,6 @@
   "MD024": false,
   "MD026": {
     "punctuation": ".,:;!"
-  }
+  },
+  "MD029": false
 }

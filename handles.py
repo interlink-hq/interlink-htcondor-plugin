@@ -868,8 +868,9 @@ def produce_htcondor_host_script(container, metadata):
     sub_path = f"{datarootfolder}{name}-{uid}.jdl"
     try:
         with open(executable_path, "w") as f:
-            batch_macros = f"""#!{container["command"][-1]}
-""" + "\n".join(container["args"][-1].split("; "))
+            shebang_line = f"#!{container['command'][-1]}\n"
+            script_body = "\n".join(container["args"][-1].split("; "))
+            batch_macros = shebang_line + script_body
 
             f.write(batch_macros)
 

@@ -38,7 +38,7 @@ This file is intended to help Copilot-style assistants (and contributors) unders
   1. POST /create with an InterLink CreateStruct (pod + container resolved objects).
   2. handles.py validates the pod, prepares env files, mounts, and probe scripts (prepare_env_file, prepare_mounts, prepare_probes).
   3. produce_htcondor_singularity_script writes an executable shell script and a JDL (.jdl) submit file. It injects helpers (runCtn/waitCtns/endScript) and probe sub-shells.
-  4. htcondor_batch_submit runs condor_submit (either locally or to a specified pool) and parses the returned cluster id.
+  4. htcondor_batch_submit runs condor_submit (either locally or to a specified pool) and parses the returned cluster ID.
   5. Job output and per-container logs are transferred back and retrieved by LogsHandler (via condor_tail) or from the DataRootFolder.
 
 3) Key conventions and repository-specific patterns

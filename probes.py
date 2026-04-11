@@ -179,7 +179,7 @@ def generate_probe_script(
     # ------------------------------------------------------------------ #
     # Helper function definitions                                          #
     # ------------------------------------------------------------------ #
-    lines.append("""
+    http_probe_helper = """
 # ---- Probe helper functions ----
 executeHTTPProbe() {
     local scheme="$1"
@@ -196,18 +196,20 @@ executeHTTPProbe() {
     timeout "${timeout}" curl -f -s "$url" &>/dev/null
     return $?
 }
-""")
+"""
+    lines.append(http_probe_helper)
 
-    lines.append(f"""executeExecProbe() {{
+    exec_probe_helper = f"""executeExecProbe() {{
     local timeout="$1"
     shift
     local command=("$@")
     timeout "${{timeout}}" {singularity_exec_prefix} "${{command[@]}}"
     return $?
 }}
-""")
+"""
+    lines.append(exec_probe_helper)
 
-    lines.append(f"""
+    orchestration_helpers = f"""
 workingPath="${{workingPath:-/tmp}}"
 
 shutDownContainersOnProbeFail() {{
@@ -402,7 +404,8 @@ waitForProbes() {{
         sleep 1
     done
 }}
-""")
+"""
+    lines.append(orchestration_helpers)
 
     # ------------------------------------------------------------------ #
     # Probe invocation block (runs in a sub-shell in the background)       #
