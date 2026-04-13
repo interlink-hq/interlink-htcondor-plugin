@@ -474,6 +474,10 @@ def parse_string_with_suffix(value_str):
         return 1
 
 
+# Maximum number of seconds to allow a preStop lifecycle hook to run.
+_PRESTOP_HOOK_TIMEOUT_SECONDS = 30
+
+
 def _translate_lifecycle_hook(handler):
     """Translate a Kubernetes lifecycle handler dict to an internal spec.
 
@@ -584,16 +588,20 @@ def generate_prestop_trap(containers, metadata):
         if hook["type"] == "exec":
             quoted_args = [shlex.quote(a) for a in hook["command"]]
             if image and singularity_path:
+                # Run the hook inside the container via singularity exec.
+                # `timeout` is placed after the image name so it executes inside
+                # the container (consistent with the SLURM plugin reference
+                # implementation), limiting how long the hook command may run.
                 parts = [shlex.quote(singularity_path), "exec"]
                 if singularity_options:
                     parts.extend(shlex.quote(o) for o in singularity_options.split())
                 parts.append(shlex.quote(image))
-                parts.extend(["timeout", "30"])
+                parts.extend(["timeout", str(_PRESTOP_HOOK_TIMEOUT_SECONDS)])
                 parts.extend(quoted_args)
                 lines.append(f'  {" ".join(parts)} >> {out_file} 2>&1 || true\n')
             else:
                 lines.append(
-                    f'  timeout 30 {" ".join(quoted_args)} >> {out_file} 2>&1 || true\n'
+                    f'  timeout {_PRESTOP_HOOK_TIMEOUT_SECONDS} {" ".join(quoted_args)} >> {out_file} 2>&1 || true\n'
                 )
 
         elif hook["type"] == "httpget":
