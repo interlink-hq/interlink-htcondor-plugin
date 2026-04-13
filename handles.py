@@ -474,8 +474,134 @@ def parse_string_with_suffix(value_str):
         return 1
 
 
-# Maximum number of seconds to allow a preStop lifecycle hook to run.
-_PRESTOP_HOOK_TIMEOUT_SECONDS = 30
+# Maximum number of seconds to allow a preStop or postStart lifecycle hook to run.
+_LIFECYCLE_HOOK_TIMEOUT_SECONDS = 30
+
+# Regex to detect an existing --bind spec whose destination is /tmp.
+_RE_TMP_BIND = re.compile(r"([^,:\s]+):/tmp(?::|,|\s|$)")
+
+
+def _find_tmp_bind_in_tokens(cmd_tokens):
+    """Scan a list of singularity command tokens for a --bind spec with /tmp.
+
+    Returns the host-side path if found, or None if /tmp is not already bound.
+    This is used to decide whether the lifecycle hook needs to inject its own
+    ``hook-tmp`` directory.
+    """
+    for tok in cmd_tokens:
+        m = _RE_TMP_BIND.search(tok)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _find_image_in_tokens(cmd_tokens):
+    """Return the first token that looks like a container image, or empty string."""
+    for tok in cmd_tokens:
+        if tok.startswith("docker://") or tok.startswith("/cvmfs"):
+            return tok
+    return ""
+
+
+def _inject_hook_tmp_into_cmd(cmd_tokens):
+    """Insert ``--bind "${workingPath}/hook-tmp:/tmp"`` before the image token.
+
+    The bind value uses a shell variable (``${workingPath}``) so that it
+    expands at script runtime rather than at script-generation time.
+
+    Returns a new list; does NOT modify the original.
+    """
+    bind_val = '"${workingPath}/hook-tmp:/tmp"'
+    for i, tok in enumerate(cmd_tokens):
+        if tok.startswith("docker://") or tok.startswith("/cvmfs"):
+            new = list(cmd_tokens)
+            new.insert(i, bind_val)
+            new.insert(i, "--bind")
+            return new
+    # Image token not found — return unchanged and let the hook run without
+    # an explicit /tmp injection.
+    logging.warning(
+        "_inject_hook_tmp_into_cmd: image token not found in command tokens; "
+        "skipping /tmp injection for lifecycle hook"
+    )
+    return list(cmd_tokens)
+
+
+def _generate_poststart_fragment(
+    ctn_name,
+    hook_spec,
+    hook_tmp_bind,
+    singularity_path,
+    singularity_options,
+    cmd_tokens,
+):
+    """Generate a bash fragment that runs a postStart lifecycle hook.
+
+    The fragment runs *synchronously* before the ``runCtn`` call so that the
+    hook's side-effects (e.g. creating ``/tmp/poststart-marker``) are visible
+    to the container immediately when it starts.
+
+    Parameters
+    ----------
+    ctn_name:
+        Container name (used for comments and output file naming).
+    hook_spec:
+        Parsed hook dict produced by ``_translate_lifecycle_hook``.
+    hook_tmp_bind:
+        The ``--bind`` spec string for /tmp sharing (e.g.
+        ``'"${workingPath}/hook-tmp:/tmp"'``).  May be empty if the caller
+        already injected the bind into ``cmd_tokens``.
+    singularity_path:
+        Path to the singularity binary.
+    singularity_options:
+        Extra singularity flags from the pod annotation.
+    cmd_tokens:
+        The (potentially modified) container command tokens; used to extract
+        the container image.
+
+    Returns
+    -------
+    str
+        Bash script fragment (no trailing newline).
+    """
+    image = _find_image_in_tokens(cmd_tokens)
+    out_file = f'"${{_IL_POD_NAME}}-${{_IL_POD_UID}}-{ctn_name}.out"'
+
+    lines = [f"# postStart hook for container {ctn_name}\n"]
+    lines.append(
+        f'printf "%s\\n" "$(date -Is --utc) Running postStart hook for container {ctn_name}..." >> {out_file} 2>&1\n'  # noqa: E501
+    )
+
+    if hook_spec["type"] == "exec":
+        quoted_args = [shlex.quote(a) for a in hook_spec["command"]]
+        if image and singularity_path:
+            parts = [shlex.quote(singularity_path), "exec"]
+            if singularity_options:
+                parts.extend(shlex.quote(o) for o in singularity_options.split())
+            if hook_tmp_bind:
+                parts.extend(["--bind", hook_tmp_bind])
+            parts.append(shlex.quote(image))
+            parts.extend(["timeout", str(_LIFECYCLE_HOOK_TIMEOUT_SECONDS)])
+            parts.extend(quoted_args)
+            lines.append(f'{" ".join(parts)} >> {out_file} 2>&1 || true\n')
+        else:
+            lines.append(
+                f'timeout {_LIFECYCLE_HOOK_TIMEOUT_SECONDS} {" ".join(quoted_args)} >> {out_file} 2>&1 || true\n'  # noqa: E501
+            )
+
+    elif hook_spec["type"] == "httpget":
+        url = (
+            f'{hook_spec["scheme"]}://{hook_spec["host"]}'
+            f':{hook_spec["port"]}{hook_spec["path"]}'
+        )
+        lines.append(
+            f"curl -f -s --max-time 10 {shlex.quote(url)} >> {out_file} 2>&1 || true\n"
+        )
+
+    lines.append(
+        f'printf "%s\\n" "$(date -Is --utc) postStart hook for container {ctn_name} completed." >> {out_file} 2>&1\n'  # noqa: E501
+    )
+    return "".join(lines)
 
 
 def _translate_lifecycle_hook(handler):
@@ -519,7 +645,9 @@ def _translate_lifecycle_hook(handler):
             "path": http.get("path") or "/",
         }
 
-    logging.warning("Unsupported lifecycle hook type in handler %r; hook will be skipped", handler)
+    logging.warning(
+        "Unsupported lifecycle hook type in handler %r; hook will be skipped", handler
+    )
     return None
 
 
@@ -572,7 +700,7 @@ def generate_prestop_trap(containers, metadata):
     lines = [
         "\n# PreStop lifecycle hooks — executed when the job receives SIGTERM\n",
         "preStopTrap() {\n",
-        '  printf "%s\\n" "$(date -Is --utc) Received SIGTERM: running preStop lifecycle hooks..."\n',
+        '  printf "%s\\n" "$(date -Is --utc) Received SIGTERM: running preStop lifecycle hooks..."\n',  # noqa: E501
     ]
 
     for entry in entries:
@@ -582,7 +710,7 @@ def generate_prestop_trap(containers, metadata):
         out_file = f'"${{workingPath}}/prestop-{name}.out"'
 
         lines.append(
-            f'  printf "%s\\n" "$(date -Is --utc) Running preStop hook for container {name}..."\n'
+            f'  printf "%s\\n" "$(date -Is --utc) Running preStop hook for container {name}..."\n'  # noqa: E501
         )
 
         if hook["type"] == "exec":
@@ -596,26 +724,26 @@ def generate_prestop_trap(containers, metadata):
                 if singularity_options:
                     parts.extend(shlex.quote(o) for o in singularity_options.split())
                 parts.append(shlex.quote(image))
-                parts.extend(["timeout", str(_PRESTOP_HOOK_TIMEOUT_SECONDS)])
+                parts.extend(["timeout", str(_LIFECYCLE_HOOK_TIMEOUT_SECONDS)])
                 parts.extend(quoted_args)
                 lines.append(f'  {" ".join(parts)} >> {out_file} 2>&1 || true\n')
             else:
                 lines.append(
-                    f'  timeout {_PRESTOP_HOOK_TIMEOUT_SECONDS} {" ".join(quoted_args)} >> {out_file} 2>&1 || true\n'
+                    f'  timeout {_LIFECYCLE_HOOK_TIMEOUT_SECONDS} {" ".join(quoted_args)} >> {out_file} 2>&1 || true\n'  # noqa: E501
                 )
 
         elif hook["type"] == "httpget":
             url = f'{hook["scheme"]}://{hook["host"]}:{hook["port"]}{hook["path"]}'
             lines.append(
-                f"  curl -f -s --max-time 10 {shlex.quote(url)} >> {out_file} 2>&1 || true\n"
+                f"  curl -f -s --max-time 10 {shlex.quote(url)} >> {out_file} 2>&1 || true\n"  # noqa: E501
             )
 
     lines += [
-        '  printf "%s\\n" "$(date -Is --utc) preStop hooks completed, terminating containers..."\n',
+        '  printf "%s\\n" "$(date -Is --utc) preStop hooks completed, terminating containers..."\n',  # noqa: E501
         "  for pidCtn in ${pidCtns} ; do\n",
         '    pid="${pidCtn%:*}"\n',
         '    ctn="${pidCtn#*:}"\n',
-        '    printf "%s\\n" "$(date -Is --utc) Sending SIGTERM to container ${ctn} pid ${pid}..."\n',
+        '    printf "%s\\n" "$(date -Is --utc) Sending SIGTERM to container ${ctn} pid ${pid}..."\n',  # noqa: E501
         '    kill "${pid}" 2>/dev/null || true\n',
         "  done\n",
         "  wait\n",
@@ -825,6 +953,7 @@ def produce_htcondor_singularity_script(
     cleanup_scripts=None,
     init_container_commands=None,
     prestop_trap=None,
+    poststart_hooks=None,
 ):
     """Write the HTCondor job executable and submit description file.
 
@@ -863,6 +992,11 @@ def produce_htcondor_singularity_script(
         Bash script fragment produced by prepare_lifecycle_hooks() that defines
         ``preStopTrap()`` and registers it as the SIGTERM trap.  Pass None
         (default) when no container has a preStop hook.
+    poststart_hooks:
+        Dict mapping container name to a parsed hook spec dict (the result of
+        ``_translate_lifecycle_hook``), or ``None`` if the container has no
+        postStart hook.  Pass None (default) when no container has a postStart
+        hook.
     """
     if probe_scripts is None:
         probe_scripts = []
@@ -872,6 +1006,8 @@ def produce_htcondor_singularity_script(
         init_container_commands = []
     if prestop_trap is None:
         prestop_trap = ""
+    if poststart_hooks is None:
+        poststart_hooks = {}
 
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
@@ -984,8 +1120,37 @@ def produce_htcondor_singularity_script(
             script_body += 'pidCtns=""\n'
             script_body += "export workingPath=$(pwd)\n\n"
 
+            # Singularity path/options needed for postStart hook generation.
+            _sing_path = InterLinkConfigInst.get("SingularityPath", "singularity")
+            _sing_opts = metadata.get("annotations", {}).get(
+                "slurm-job.vk.io/singularity-options", ""
+            )
+
             for ctn_name, cmd_tokens in container_commands:
-                cleaned = _clean_command_tokens(cmd_tokens)
+                hook = poststart_hooks.get(ctn_name)
+                if hook:
+                    existing_tmp = _find_tmp_bind_in_tokens(cmd_tokens)
+                    if existing_tmp:
+                        # Reuse the user-supplied /tmp mount in the hook.
+                        hook_tmp_bind = f'"{existing_tmp}:/tmp"'
+                        final_tokens = cmd_tokens
+                    else:
+                        # No /tmp mount: create hook-tmp and inject the bind.
+                        hook_tmp_bind = '"${workingPath}/hook-tmp:/tmp"'
+                        script_body += 'mkdir -p "${workingPath}/hook-tmp"\n'
+                        final_tokens = _inject_hook_tmp_into_cmd(cmd_tokens)
+
+                    script_body += _generate_poststart_fragment(
+                        ctn_name,
+                        hook,
+                        hook_tmp_bind,
+                        _sing_path,
+                        _sing_opts,
+                        final_tokens,
+                    )
+                    cleaned = _clean_command_tokens(final_tokens)
+                else:
+                    cleaned = _clean_command_tokens(cmd_tokens)
                 script_body += f"runCtn {ctn_name} {cleaned}\n"
 
             # ---- wait for all containers and exit -----------------------
@@ -1271,6 +1436,8 @@ def SubmitHandler():
         # mirroring the SLURM plugin's runCtn pattern.
         container_commands = []
         init_container_commands = []
+        # poststart_hooks maps container name → parsed hook spec (or None).
+        poststart_hooks = {}
         # all_input_files is accumulated across all containers (deduped via seen set)
         all_input_files = []
         seen_input_files = set()
@@ -1513,6 +1680,13 @@ def SubmitHandler():
             # Collect as (name, tokens) for runCtn pattern
             container_commands.append((container["name"], singularity_command))
 
+            # Collect postStart hook (if defined) for this container.
+            lifecycle = container.get("lifecycle") or {}
+            poststart_raw = lifecycle.get("postStart")
+            poststart_hooks[container["name"]] = (
+                _translate_lifecycle_hook(poststart_raw) if poststart_raw else None
+            )
+
         prestop_trap = prepare_lifecycle_hooks(containers, metadata)
 
         path = produce_htcondor_singularity_script(
@@ -1524,6 +1698,7 @@ def SubmitHandler():
             cleanup_scripts=cleanup_scripts,
             init_container_commands=init_container_commands,
             prestop_trap=prestop_trap,
+            poststart_hooks=poststart_hooks,
         )
 
     else:

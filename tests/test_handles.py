@@ -272,6 +272,7 @@ def _make_script(
     cleanup_scripts=None,
     data_root=None,
     prestop_trap=None,
+    poststart_hooks=None,
 ):
     """Call produce_htcondor_singularity_script in a temp dir and return the
     generated bash script content."""
@@ -295,6 +296,7 @@ def _make_script(
                 probe_scripts=probe_scripts,
                 cleanup_scripts=cleanup_scripts,
                 prestop_trap=prestop_trap,
+                poststart_hooks=poststart_hooks,
             )
         finally:
             if orig_dr is None:
@@ -924,6 +926,227 @@ class TestPrepareLifecycleHooks:
         containers = [{"name": "c1", "image": "busybox:latest"}]
         result = handles.prepare_lifecycle_hooks(containers, _BASE_METADATA)
         assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# postStart lifecycle hook tests
+# ---------------------------------------------------------------------------
+
+
+class TestPostStartHelpers:
+    """Unit tests for _find_tmp_bind_in_tokens, _find_image_in_tokens,
+    _inject_hook_tmp_into_cmd."""
+
+    def test_find_tmp_bind_not_present(self):
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        assert handles._find_tmp_bind_in_tokens(tokens) is None
+
+    def test_find_tmp_bind_present(self):
+        tokens = [
+            "singularity",
+            "exec",
+            "--bind",
+            "/host/tmp:/tmp",
+            "docker://busybox:latest",
+            "sh",
+        ]
+        assert handles._find_tmp_bind_in_tokens(tokens) == "/host/tmp"
+
+    def test_find_tmp_bind_in_comma_spec(self):
+        tokens = ["singularity", "exec", "--bind", "/a:/b,/h/t:/tmp", "docker://img", "sh"]
+        assert handles._find_tmp_bind_in_tokens(tokens) == "/h/t"
+
+    def test_find_image_docker_prefix(self):
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        assert handles._find_image_in_tokens(tokens) == "docker://busybox:latest"
+
+    def test_find_image_cvmfs(self):
+        tokens = ["singularity", "exec", "/cvmfs/img.sif", "sh"]
+        assert handles._find_image_in_tokens(tokens) == "/cvmfs/img.sif"
+
+    def test_find_image_not_found(self):
+        tokens = ["singularity", "exec", "sh"]
+        assert handles._find_image_in_tokens(tokens) == ""
+
+    def test_inject_hook_tmp_adds_bind_before_image(self):
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._inject_hook_tmp_into_cmd(tokens)
+        img_pos = result.index("docker://busybox:latest")
+        assert result[img_pos - 2] == "--bind"
+        assert "${workingPath}/hook-tmp:/tmp" in result[img_pos - 1]
+
+    def test_inject_hook_tmp_preserves_other_tokens(self):
+        tokens = ["singularity", "exec", "--bind", "src:/dst", "docker://img", "cmd"]
+        result = handles._inject_hook_tmp_into_cmd(tokens)
+        assert "singularity" in result
+        assert "docker://img" in result
+        assert "cmd" in result
+
+
+class TestGeneratePostStartFragment:
+    """Unit tests for _generate_poststart_fragment."""
+
+    def _base_metadata(self):
+        return {"name": "p", "uid": "u", "annotations": {}}
+
+    def test_exec_hook_runs_in_singularity(self):
+        hook = {"type": "exec", "command": ["/bin/sh", "-c", "echo hi"]}
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, '"${workingPath}/hook-tmp:/tmp"', "singularity", "", tokens
+        )
+        assert "singularity" in result
+        assert "docker://busybox:latest" in result
+        assert "timeout" in result
+
+    def test_exec_hook_logs_to_container_out_file(self):
+        hook = {"type": "exec", "command": ["/bin/sh", "-c", "echo hi"]}
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, '"${workingPath}/hook-tmp:/tmp"', "singularity", "", tokens
+        )
+        assert "${_IL_POD_NAME}-${_IL_POD_UID}-c1.out" in result
+
+    def test_httpget_hook_uses_curl(self):
+        hook = {
+            "type": "httpget",
+            "scheme": "http",
+            "host": "localhost",
+            "port": 8080,
+            "path": "/ready",
+        }
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, "", "singularity", "", tokens
+        )
+        assert "curl" in result
+        assert "http://localhost:8080/ready" in result
+
+    def test_hook_tmp_bind_included_in_singularity_call(self):
+        hook = {"type": "exec", "command": ["true"]}
+        tokens = ["singularity", "exec", "docker://busybox:latest", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1",
+            hook,
+            '"${workingPath}/hook-tmp:/tmp"',
+            "singularity",
+            "",
+            tokens,
+        )
+        assert "${workingPath}/hook-tmp:/tmp" in result
+
+    def test_singularity_options_included(self):
+        hook = {"type": "exec", "command": ["true"]}
+        tokens = ["singularity", "exec", "docker://img", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, "", "singularity", "--nv", tokens
+        )
+        assert "--nv" in result
+
+    def test_completion_message_present(self):
+        hook = {"type": "exec", "command": ["true"]}
+        tokens = ["singularity", "exec", "docker://img", "sh"]
+        result = handles._generate_poststart_fragment(
+            "c1", hook, "", "singularity", "", tokens
+        )
+        assert "postStart hook for container c1 completed" in result
+
+
+class TestPostStartInScript:
+    """Integration tests: postStart hook is injected into the generated script."""
+
+    def _container_with_poststart(self, name="c1", image="docker://busybox:latest"):
+        return {
+            "name": name,
+            "image": image,
+            "lifecycle": {
+                "postStart": {"exec": {"command": ["/bin/sh", "-c", "echo started"]}}
+            },
+        }
+
+    def _poststart_hooks(self, container):
+        lifecycle = container.get("lifecycle") or {}
+        ps = lifecycle.get("postStart")
+        return {container["name"]: handles._translate_lifecycle_hook(ps) if ps else None}
+
+    def test_no_poststart_when_not_defined(self):
+        container = _container("c1", "docker://busybox:latest")
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+        )
+        assert "postStart hook" not in script
+
+    def test_poststart_fragment_injected(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        assert "postStart hook for container c1" in script
+
+    def test_poststart_runs_before_runctn(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        ps_pos = script.index("postStart hook for container c1")
+        runctn_pos = script.index("runCtn c1")
+        assert ps_pos < runctn_pos
+
+    def test_hook_tmp_dir_created_when_no_tmp_mount(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        assert 'mkdir -p "${workingPath}/hook-tmp"' in script
+
+    def test_hook_tmp_bind_injected_into_runctn_command(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        script = _make_script(
+            [container],
+            [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
+            poststart_hooks=hooks,
+        )
+        # The runCtn call for c1 must include the hook-tmp bind
+        runctn_line = next(
+            ln for ln in script.splitlines() if ln.startswith("runCtn c1")
+        )
+        assert "${workingPath}/hook-tmp:/tmp" in runctn_line
+
+    def test_no_extra_hook_tmp_when_tmp_already_bound(self):
+        container = self._container_with_poststart()
+        hooks = self._poststart_hooks(container)
+        # cmd_tokens already has a /tmp bind
+        tokens = [
+            "singularity",
+            "exec",
+            "--bind",
+            "/host/tmp:/tmp",
+            "docker://busybox:latest",
+            "sh",
+        ]
+        script = _make_script(
+            [container],
+            [("c1", tokens)],
+            poststart_hooks=hooks,
+        )
+        # hook-tmp directory should NOT be created
+        assert 'mkdir -p "${workingPath}/hook-tmp"' not in script
+
+
+# ---------------------------------------------------------------------------
+# API compatibility tests — interlink 0.6.1
+# ---------------------------------------------------------------------------
 
 
 def _flask_test_client():
