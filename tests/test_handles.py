@@ -1211,8 +1211,9 @@ class TestCreateResponseFormat:
 
 class TestJobScriptPath:
     """/create with a non-empty 'jobScript' field must write the script to disk,
-    submit it as a single 'jobScript' container via produce_htcondor_singularity_script,
-    and return HTTP 200 with the correct PodUID/PodJID (mirrors SLURM plugin behavior)."""
+    submit it as a single 'jobScript' container via
+    produce_htcondor_singularity_script, and return HTTP 200 with the correct
+    PodUID/PodJID (mirrors SLURM plugin behavior)."""
 
     _CUSTOM_SCRIPT = "#!/bin/bash\necho hello from custom script\n"
 
@@ -1241,7 +1242,9 @@ class TestJobScriptPath:
             captured["kwargs"] = kw
             return str(tmp_path / "fake.jdl")
 
-        monkeypatch.setattr(handles, "produce_htcondor_singularity_script", _fake_produce)
+        monkeypatch.setattr(
+            handles, "produce_htcondor_singularity_script", _fake_produce
+        )
         payload = _json.dumps(
             {"pod": _make_pod(), "container": [], "jobScript": job_script}
         )
@@ -1261,7 +1264,9 @@ class TestJobScriptPath:
         script_path = tmp_path / "test-pod-uid-123" / "jobScript.sh"
         assert script_path.stat().st_mode & 0o100, "jobScript.sh is not executable"
 
-    def test_produce_called_with_single_jobscript_container(self, tmp_path, monkeypatch):
+    def test_produce_called_with_single_jobscript_container(
+        self, tmp_path, monkeypatch
+    ):
         _, captured = self._call_create_with_job_script(tmp_path, monkeypatch)
         assert "container_commands" in captured
         assert len(captured["container_commands"]) == 1
@@ -1315,7 +1320,9 @@ class TestJobScriptPath:
             called_with_jobscript_name["names"] = [n for n, _ in container_commands]
             return str(tmp_path / "fake.jdl")
 
-        monkeypatch.setattr(handles, "produce_htcondor_singularity_script", _fake_produce)
+        monkeypatch.setattr(
+            handles, "produce_htcondor_singularity_script", _fake_produce
+        )
         payload = _json.dumps(
             {"pod": _make_pod(), "container": [], "jobScript": ""}
         )
