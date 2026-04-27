@@ -1,0 +1,30 @@
+---
+apiVersion: v1
+kind: Pod
+metadata:
+    name: test-pod-gpu
+spec:
+    restartPolicy: OnFailure
+    containers:
+        - image: docker://nvidia/cuda:12.6.3-base-ubuntu24.04
+          command:
+              - /bin/bash
+              - -c
+              - |
+                echo "=== GPU Test Start ==="
+                nvidia-smi -L
+                echo "Assigned GPUs: $CUDA_VISIBLE_DEVICES"
+                echo "=== GPU Test End ==="
+          imagePullPolicy: Always
+          name: gpu-test
+          resources:
+              limits:
+                  memory: "512M"
+                  cpu: "1"
+                  nvidia.com/gpu: "2"
+    dnsPolicy: ClusterFirst
+    nodeSelector:
+        kubernetes.io/hostname: interlink-htcondor
+    tolerations:
+        - key: virtual-node.interlink/no-schedule
+          operator: Exists

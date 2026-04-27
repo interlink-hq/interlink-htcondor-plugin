@@ -1022,15 +1022,16 @@ def produce_htcondor_singularity_script(
 
     requested_cpus = 0
     requested_memory = 0
+    requested_gpus = 0
     for c in containers:
-        if "resources" in c.keys():
-            if "requests" in c["resources"].keys():
-                if "cpu" in c["resources"]["requests"].keys():
-                    requested_cpus += parse_cpu(c["resources"]["requests"]["cpu"])
-                if "memory" in c["resources"]["requests"].keys():
-                    requested_memory += parse_string_with_suffix(
-                        c["resources"]["requests"]["memory"]
-                    )
+        if "resources" in c:
+            limits = c["resources"].get("limits", {})
+            if "cpu" in limits:
+                requested_cpus += parse_cpu(limits["cpu"])
+            if "memory" in limits:
+                requested_memory += parse_string_with_suffix(limits["memory"])
+            if "nvidia.com/gpu" in limits:
+                requested_gpus += int(limits["nvidia.com/gpu"])
     if requested_cpus == 0:
         requested_cpus = 1
     if requested_memory == 0:
@@ -1198,6 +1199,7 @@ Error      = err/mm_mul.err.$(Cluster).$(Process)
 should_transfer_files = YES
 RequestCpus = {requested_cpus}
 RequestMemory = {requested_memory}
+RequestGpus = {requested_gpus}
 
 # Retry if the job is held due to the permission error (Code 12, Subcode 13)
 periodic_release = (HoldReasonCode == 12 && HoldReasonSubCode == 13)
@@ -1452,6 +1454,9 @@ def SubmitHandler():
             singularity_options = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/singularity-options", ""
             )
+            if "nvidia.com/gpu" in container.get("resources", {}).get("limits", {}):
+                if "--nv" not in singularity_options:
+                    singularity_options = ("--nv " + singularity_options).strip()
             pre_exec = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/pre-exec", ""
             )
@@ -1559,6 +1564,9 @@ def SubmitHandler():
             singularity_options = metadata.get("annotations", {}).get(
                 "slurm-job.vk.io/singularity-options", ""
             )
+            if "nvidia.com/gpu" in container.get("resources", {}).get("limits", {}):
+                if "--nv" not in singularity_options:
+                    singularity_options = ("--nv " + singularity_options).strip()
 
             # flags = metadata.get("annotations", {}).get(
             #     "slurm-job.vk.io/flags", "")
