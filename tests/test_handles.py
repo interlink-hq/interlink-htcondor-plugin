@@ -1341,7 +1341,10 @@ class TestStopHandler:
         monkeypatch.setattr(handles.args, "schedd_host", "schedd.example")
         seen = {}
 
-        def fake_run(cmd, capture_output, text):
+        def fake_run(cmd, capture_output, text, timeout):
+            assert capture_output is True
+            assert text is True
+            assert timeout == 60
             seen["cmd"] = cmd
 
             class Result:
@@ -1373,7 +1376,10 @@ class TestStopHandler:
         monkeypatch.setattr(handles.args, "schedd_host", "")
         seen = {}
 
-        def fake_run(cmd, capture_output, text):
+        def fake_run(cmd, capture_output, text, timeout):
+            assert capture_output is True
+            assert text is True
+            assert timeout == 60
             seen["cmd"] = cmd
 
             class Result:
@@ -1397,7 +1403,10 @@ class TestStopHandler:
         monkeypatch.setattr(handles.args, "collector_host", "")
         monkeypatch.setattr(handles.args, "schedd_host", "")
 
-        def fake_run(cmd, capture_output, text):
+        def fake_run(cmd, capture_output, text, timeout):
+            assert capture_output is True
+            assert text is True
+            assert timeout == 60
             class Result:
                 returncode = 1
                 stdout = ""
@@ -1414,6 +1423,17 @@ class TestStopHandler:
         assert resp.status_code == 500
         data = _json.loads(resp.data)
         assert "condor_rm failed" in data["error"]
+
+    def test_delete_returns_500_when_jid_is_invalid(self, tmp_path, monkeypatch):
+        self._setup_pod_jid(tmp_path, monkeypatch, "not-a-jid")
+        resp = _flask_test_client().post(
+            "/delete",
+            data=_json.dumps({"metadata": {"name": "pod-a", "uid": "uid-a"}}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 500
+        data = _json.loads(resp.data)
+        assert "Invalid job id" in data["error"]
 
 
 class TestLogsHandler:

@@ -1330,9 +1330,9 @@ def delete_pod(pod):
     with open(jid_path) as f:
         data = f.read()
     jid_raw = data.strip()
-    cluster_id = jid_raw.split(".")[0]
-    if not cluster_id.isdigit():
+    if not re.fullmatch(r"\d+(?:\.\d+)?", jid_raw):
         raise ValueError(f"Invalid job id in {jid_path}: {jid_raw!r}")
+    cluster_id = jid_raw.split(".")[0]
 
     collector = args.collector_host
     schedd = args.schedd_host
@@ -1341,7 +1341,7 @@ def delete_pod(pod):
     else:
         cmd = ["condor_rm", cluster_id]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
         raise RuntimeError(
             f"condor_rm failed (exit {result.returncode}): {result.stderr.strip()}"
