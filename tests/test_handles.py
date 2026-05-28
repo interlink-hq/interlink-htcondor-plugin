@@ -1322,6 +1322,100 @@ class TestStatusHandlerMultiPod:
         assert statuses[0]["name"] == "pod-a"
 
 
+class TestStopHandler:
+    def _setup_pod_jid(self, tmp_path, monkeypatch, jid):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        job_dir = tmp_path / "pod-a-uid-a"
+        job_dir.mkdir()
+        (job_dir / "pod-a-uid-a.jid").write_text(jid)
+
+    def test_delete_uses_remote_condor_rm_when_pool_and_schedd_set(
+        self, tmp_path, monkeypatch
+    ):
+        self._setup_pod_jid(tmp_path, monkeypatch, "100")
+        monkeypatch.setattr(handles.args, "collector_host", "collector.example")
+        monkeypatch.setattr(handles.args, "schedd_host", "schedd.example")
+        seen = {}
+
+        def fake_run(cmd, capture_output, text):
+            seen["cmd"] = cmd
+
+            class Result:
+                returncode = 0
+                stdout = "Job 100 marked for removal"
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setattr(handles.subprocess, "run", fake_run)
+        resp = _flask_test_client().post(
+            "/delete",
+            data=_json.dumps({"metadata": {"name": "pod-a", "uid": "uid-a"}}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        assert seen["cmd"] == [
+            "condor_rm",
+            "-pool",
+            "collector.example",
+            "-name",
+            "schedd.example",
+            "100",
+        ]
+
+    def test_delete_accepts_procid_in_jid_file(self, tmp_path, monkeypatch):
+        self._setup_pod_jid(tmp_path, monkeypatch, "101.0")
+        monkeypatch.setattr(handles.args, "collector_host", "")
+        monkeypatch.setattr(handles.args, "schedd_host", "")
+        seen = {}
+
+        def fake_run(cmd, capture_output, text):
+            seen["cmd"] = cmd
+
+            class Result:
+                returncode = 0
+                stdout = "All jobs removed."
+                stderr = ""
+
+            return Result()
+
+        monkeypatch.setattr(handles.subprocess, "run", fake_run)
+        resp = _flask_test_client().post(
+            "/delete",
+            data=_json.dumps({"metadata": {"name": "pod-a", "uid": "uid-a"}}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        assert seen["cmd"] == ["condor_rm", "101"]
+
+    def test_delete_returns_500_when_condor_rm_fails(self, tmp_path, monkeypatch):
+        self._setup_pod_jid(tmp_path, monkeypatch, "102")
+        monkeypatch.setattr(handles.args, "collector_host", "")
+        monkeypatch.setattr(handles.args, "schedd_host", "")
+
+        def fake_run(cmd, capture_output, text):
+            class Result:
+                returncode = 1
+                stdout = ""
+                stderr = "Failed to contact schedd"
+
+            return Result()
+
+        monkeypatch.setattr(handles.subprocess, "run", fake_run)
+        resp = _flask_test_client().post(
+            "/delete",
+            data=_json.dumps({"metadata": {"name": "pod-a", "uid": "uid-a"}}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 500
+        data = _json.loads(resp.data)
+        assert "condor_rm failed" in data["error"]
+
+
 class TestLogsHandler:
     def test_getlogs_uses_sandbox_filename_for_condor_tail(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
