@@ -460,11 +460,14 @@ def parse_string_with_suffix(value_str):
         "Gi": 1024,
     }
 
-    match = re.match(r"(\d+)([a-zA-Z]+)", value_str)
+    value_str = str(value_str).strip()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([a-zA-Z]+)?", value_str)
     if match:
         numeric_part = match.group(1)
         suffix = match.group(2)
-        if suffix in suffixes:
+        if suffix is None:
+            return max(1, int(math.ceil(float(numeric_part) / 1024**2)))
+        elif suffix in suffixes:
             numeric_value = int(float(numeric_part) * suffixes[suffix])
             return numeric_value
         else:
