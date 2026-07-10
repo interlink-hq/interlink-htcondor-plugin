@@ -1009,6 +1009,28 @@ def produce_htcondor_singularity_script(
     if poststart_hooks is None:
         poststart_hooks = {}
 
+    # FullMesh pre-exec
+    _MESH_MARKER = "EOFMESH"
+
+    def _split_mesh_pre_exec(commands):
+        """Extract mesh heredoc."""
+        heredoc = ""
+        stripped = []
+        for ctn_name, tokens in commands:
+            if tokens and _MESH_MARKER in tokens[0]:
+                heredoc = heredoc or tokens[0]
+                tokens = tokens[1:]
+            stripped.append((ctn_name, list(tokens)))
+        return heredoc, stripped
+
+    _mesh_init, init_container_commands = _split_mesh_pre_exec(init_container_commands)
+    _mesh_main, container_commands = _split_mesh_pre_exec(container_commands)
+    mesh_pre_exec = _mesh_init or _mesh_main
+    if mesh_pre_exec:
+        logging.info(
+            "Mesh pre-exec detected: launching first container via $TMPDIR/mesh.sh"
+        )
+
     datarootfolder = InterLinkConfigInst["DataRootFolder"]
     name = metadata["name"]
     uid = metadata["uid"]
@@ -1083,6 +1105,14 @@ def produce_htcondor_singularity_script(
             if prefix_.strip():
                 script_body += "\n" + prefix_.strip() + "\n"
 
+            # Mesh bootstrap
+            if mesh_pre_exec:
+                script_body += (
+                    "\n# FullMesh\n"
+                    'export TMPDIR="${TMPDIR:-$(mktemp -d)}"\n'
+                    'mkdir -p "$TMPDIR"\n' + mesh_pre_exec.strip() + "\n"
+                )
+
             # ---- probe background sub-shells ----------------------------
             for ps in probe_scripts:
                 script_body += "\n" + ps + "\n"
@@ -1127,6 +1157,7 @@ def produce_htcondor_singularity_script(
                 "slurm-job.vk.io/singularity-options", ""
             )
 
+            _mesh_wrapped = False
             for ctn_name, cmd_tokens in container_commands:
                 hook = poststart_hooks.get(ctn_name)
                 if hook:
@@ -1152,7 +1183,14 @@ def produce_htcondor_singularity_script(
                     cleaned = _clean_command_tokens(final_tokens)
                 else:
                     cleaned = _clean_command_tokens(cmd_tokens)
-                script_body += f"runCtn {ctn_name} {cleaned}\n"
+                # Mesh wrapper
+                if mesh_pre_exec and not _mesh_wrapped:
+                    script_body += (
+                        f'runCtn {ctn_name} bash "$TMPDIR/mesh.sh" {cleaned}\n'
+                    )
+                    _mesh_wrapped = True
+                else:
+                    script_body += f"runCtn {ctn_name} {cleaned}\n"
 
             # ---- wait for all containers and exit -----------------------
             script_body += "\nwaitCtns\nendScript\n"
