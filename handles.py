@@ -189,7 +189,13 @@ def prepare_env_file(container, metadata, container_standalone=None):
                     for secret in secrets_list:
                         if secret.get("metadata", {}).get("name") == ref_name:
                             for k, v in secret.get("data", {}).items():
-                                decoded = base64.b64decode(v).decode("utf-8") if v else ""
+                                try:
+                                    decoded = base64.b64decode(v).decode("utf-8") if v else ""
+                                except Exception:
+                                    logging.warning(
+                                        f"Secret key '{k}' in '{ref_name}' has invalid base64; using raw value"
+                                    )
+                                    decoded = v or ""
                                 lines.append(
                                     f"export {k}={_shell_single_quote(decoded)}"
                                 )

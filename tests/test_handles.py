@@ -637,7 +637,8 @@ class TestPrepareEnvFile:
             container_standalone=container_standalone,
         )
         assert env_path is not None
-        content = open(env_path).read()
+        with open(env_path) as f:
+            content = f.read()
         assert "export username='test'" in content
         assert "export password='s3cr3t!'" in content
         assert username_b64 not in content
@@ -668,7 +669,8 @@ class TestPrepareEnvFile:
             container_standalone=container_standalone,
         )
         assert env_path is not None
-        content = open(env_path).read()
+        with open(env_path) as f:
+            content = f.read()
         assert "export test='1'" in content
         assert "export mode='production'" in content
 
