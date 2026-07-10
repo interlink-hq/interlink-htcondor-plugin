@@ -608,6 +608,70 @@ class TestPrepareEnvFile:
         assert wrapped[:4] == ["/bin/sh", "-c", '. ./env.env && exec "$@"', "sh"]
         assert wrapped[4:] == ["python", "-c", "print('ok')"]
 
+    def test_envfrom_secretref_decodes_base64_values(self, tmp_path, monkeypatch):
+        import base64
+
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        username_b64 = base64.b64encode(b"test").decode("utf-8")
+        password_b64 = base64.b64encode(b"s3cr3t!").decode("utf-8")
+        container_standalone = {
+            "name": "c1",
+            "secrets": [
+                {
+                    "metadata": {"name": "mysecret"},
+                    "data": {"username": username_b64, "password": password_b64},
+                }
+            ],
+            "configMaps": [],
+        }
+        env_file_name, env_path = handles.prepare_env_file(
+            {
+                "name": "c1",
+                "envFrom": [{"secretRef": {"name": "mysecret"}}],
+            },
+            {"name": "pod-b", "uid": "uid-b"},
+            container_standalone=container_standalone,
+        )
+        assert env_path is not None
+        content = open(env_path).read()
+        assert "export username='test'" in content
+        assert "export password='s3cr3t!'" in content
+        assert username_b64 not in content
+        assert password_b64 not in content
+
+    def test_envfrom_configmapref_writes_plain_values(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        container_standalone = {
+            "name": "c1",
+            "secrets": [],
+            "configMaps": [
+                {
+                    "metadata": {"name": "my-configmap"},
+                    "data": {"test": "1", "mode": "production"},
+                }
+            ],
+        }
+        env_file_name, env_path = handles.prepare_env_file(
+            {
+                "name": "c1",
+                "envFrom": [{"configMapRef": {"name": "my-configmap"}}],
+            },
+            {"name": "pod-c", "uid": "uid-c"},
+            container_standalone=container_standalone,
+        )
+        assert env_path is not None
+        content = open(env_path).read()
+        assert "export test='1'" in content
+        assert "export mode='production'" in content
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle hook tests — _translate_lifecycle_hook, generate_prestop_trap,
