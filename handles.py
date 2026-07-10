@@ -1,5 +1,6 @@
 import argparse
 import base64
+import binascii
 import json
 import logging
 import math
@@ -191,9 +192,9 @@ def prepare_env_file(container, metadata, container_standalone=None):
                             for k, v in secret.get("data", {}).items():
                                 try:
                                     decoded = base64.b64decode(v).decode("utf-8") if v else ""
-                                except Exception:
+                                except (binascii.Error, UnicodeDecodeError):
                                     logging.warning(
-                                        f"Secret key '{k}' in '{ref_name}' has invalid base64; using raw value"
+                                        "A secret envFrom key could not be base64-decoded; using raw value"
                                     )
                                     decoded = v or ""
                                 lines.append(
