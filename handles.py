@@ -197,7 +197,9 @@ def prepare_env_file(container, metadata, container_standalone=None):
                                         decoded = base64.b64decode(v).decode("utf-8")
                                     except (binascii.Error, UnicodeDecodeError):
                                         logging.warning(
-                                            f"Secret '{ref_name}' key '{k}' could not be base64-decoded; using raw value"
+                                            f"Secret '{ref_name}' key '{k}'"
+                                            " could not be base64-decoded;"
+                                            " using raw value"
                                         )
                                         decoded = v
                                 lines.append(
