@@ -1437,6 +1437,45 @@ class TestLogsHandler:
         assert resp.data.decode() == "probe log line\n"
         assert seen["cmd"][-1] == "pod-a-uid-a-main.out"
 
+    def test_getlogs_reads_transferred_file_with_utf8(self, tmp_path, monkeypatch):
+        """LogsHandler must decode transferred log files as UTF-8.
+
+        In containers where the system locale is POSIX/ASCII (LANG=C), Python's
+        default file encoding would be ASCII.  Falling back to ASCII corrupts
+        multi-byte characters like the Unicode CHECK MARK ✓ (U+2713, UTF-8 bytes
+        E2 9C 93) into three replacement chars, breaking regex matches that
+        contain that character.  The fix is to open the file with an explicit
+        encoding="utf-8" argument.
+        """
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+
+        job_dir = tmp_path / "pod-b-uid-b"
+        job_dir.mkdir()
+        # No .jid file → condor_tail skipped; fallback to the transferred file.
+        log_file = job_dir / "pod-b-uid-b-ctn.out"
+        unicode_content = "✓ DATABASE_URL: postgresql://localhost/db\nSUCCESS\n"
+        log_file.write_bytes(unicode_content.encode("utf-8"))
+
+        resp = _flask_test_client().get(
+            "/getLogs",
+            data=_json.dumps(
+                {
+                    "PodName": "pod-b",
+                    "PodUID": "uid-b",
+                    "ContainerName": "ctn",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert "✓ DATABASE_URL: postgresql" in body
+
 
 class TestSystemInfoEndpoint:
     """/system-info must return JSON with status and htcondor_connected fields."""
