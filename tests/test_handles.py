@@ -1409,7 +1409,7 @@ class TestLogsHandler:
 
         seen = {}
 
-        def fake_run(cmd, capture_output, text, timeout):
+        def fake_run(cmd, capture_output, text, timeout, **kwargs):
             seen["cmd"] = cmd
 
             class Result:

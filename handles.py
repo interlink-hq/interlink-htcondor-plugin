@@ -2093,7 +2093,12 @@ def LogsHandler():
                             sandbox_log_filename,
                         ]
                     result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=60
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=60,
                     )
                     if result.stdout:
                         content = result.stdout
@@ -2127,7 +2132,7 @@ def LogsHandler():
                 return "", 400
             logging.info(f"GetLogs: reading transferred file {log_file_real}")
             try:
-                with open(log_file_real, "r", errors="replace") as fh:
+                with open(log_file_real, "r", encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
             except FileNotFoundError:
                 logging.info(f"GetLogs: log file not found yet: {log_file_real}")
