@@ -66,7 +66,12 @@ CommandPrefix: ""            # Optional shell prefix prepended to every job comm
                              # e.g. "source /cvmfs/cms.cern.ch/cmsset_default.sh;"
 ExportPodData: true          # Mount ConfigMaps and Secrets into the Singularity job
 DataRootFolder: ".interlink/" # Directory used to store job scripts and tracking files
+ImageOverrides:              # Optional worker-side image substitutions
+  "registry.example/image:tag": "/shared/images/image.sif"
 ```
+
+Image overrides are applied only when the plugin builds Singularity commands, allowing
+Kubernetes to keep a valid registry image while HTCondor workers use a prebuilt SIF.
 
 Create the directories expected by HTCondor and the plugin:
 

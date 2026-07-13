@@ -176,6 +176,44 @@ class TestPrepareProbesImageHandling:
         probe_script, _ = prepare_probes(container, _BASE_METADATA)
         assert "docker://" not in probe_script
 
+    def test_configured_image_override(self, monkeypatch):
+        source = "registry.example/image:tag"
+        target = "/shared/images/image.sif"
+        monkeypatch.setitem(
+            handles.InterLinkConfigInst, "ImageOverrides", {source: target}
+        )
+        container = _container(
+            image=source,
+            livenessProbe={"httpGet": {"port": 8080}},
+        )
+        probe_script, _ = prepare_probes(container, _BASE_METADATA)
+        assert f'"{target}"' in probe_script
+        assert source not in probe_script
+
+
+class TestResolveImage:
+    def test_plain_image_gets_docker_prefix(self, monkeypatch):
+        monkeypatch.setitem(handles.InterLinkConfigInst, "ImageOverrides", {})
+        assert handles._resolve_image("busybox:latest") == "docker://busybox:latest"
+
+    def test_absolute_image_is_unchanged(self, monkeypatch):
+        monkeypatch.setitem(handles.InterLinkConfigInst, "ImageOverrides", {})
+        image = "/shared/images/busybox.sif"
+        assert handles._resolve_image(image) == image
+
+    def test_docker_prefixed_source_matches_plain_override(self, monkeypatch):
+        target = "/shared/images/busybox.sif"
+        monkeypatch.setitem(
+            handles.InterLinkConfigInst,
+            "ImageOverrides",
+            {"busybox:latest": target},
+        )
+        assert handles._resolve_image("docker://busybox:latest") == target
+
+    def test_invalid_override_config_is_ignored(self, monkeypatch):
+        monkeypatch.setitem(handles.InterLinkConfigInst, "ImageOverrides", [])
+        assert handles._resolve_image("busybox:latest") == "docker://busybox:latest"
+
 
 class TestPrepareProbesAnnotations:
     def test_singularity_options_from_annotation(self):

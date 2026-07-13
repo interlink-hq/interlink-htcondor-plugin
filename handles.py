@@ -484,6 +484,32 @@ _LIFECYCLE_HOOK_TIMEOUT_SECONDS = 30
 _RE_TMP_BIND = re.compile(r"([^,:\s]+):/tmp(?::|,|\s|$)")
 
 
+def _resolve_image(image):
+    """Apply a configured image override and return a Singularity image URI."""
+    overrides = InterLinkConfigInst.get("ImageOverrides", {}) or {}
+    if not isinstance(overrides, dict):
+        logging.warning("ImageOverrides must be a mapping; ignoring configured value")
+        overrides = {}
+    candidates = [image]
+    if image.startswith("docker://"):
+        candidates.append(image.removeprefix("docker://"))
+    else:
+        candidates.append("docker://" + image)
+
+    for candidate in candidates:
+        if candidate in overrides:
+            resolved = overrides[candidate]
+            if not isinstance(resolved, str) or not resolved:
+                logging.warning("Ignoring invalid image override for %s", candidate)
+                continue
+            logging.info("Using image override for %s: %s", image, resolved)
+            return resolved
+
+    if image.startswith("/") or image.startswith("docker://"):
+        return image
+    return "docker://" + image
+
+
 def _find_tmp_bind_in_tokens(cmd_tokens):
     """Scan a list of singularity command tokens for a --bind spec with /tmp.
 
@@ -501,7 +527,7 @@ def _find_tmp_bind_in_tokens(cmd_tokens):
 def _find_image_in_tokens(cmd_tokens):
     """Return the first token that looks like a container image, or empty string."""
     for tok in cmd_tokens:
-        if tok.startswith("docker://") or tok.startswith("/cvmfs"):
+        if tok.startswith("docker://") or tok.startswith("/"):
             return tok
     return ""
 
@@ -516,7 +542,7 @@ def _inject_hook_tmp_into_cmd(cmd_tokens):
     """
     bind_val = '"${workingPath}/hook-tmp:/tmp"'
     for i, tok in enumerate(cmd_tokens):
-        if tok.startswith("docker://") or tok.startswith("/cvmfs"):
+        if tok.startswith("docker://") or tok.startswith("/"):
             new = list(cmd_tokens)
             new.insert(i, bind_val)
             new.insert(i, "--bind")
@@ -692,9 +718,7 @@ def generate_prestop_trap(containers, metadata):
         hook = _translate_lifecycle_hook(prestop)
         if hook is None:
             continue
-        image = container.get("image", "")
-        if not (image.startswith("/cvmfs") or image.startswith("docker://")):
-            image = "docker://" + image
+        image = _resolve_image(container.get("image", ""))
         entries.append({"name": container["name"], "hook": hook, "image": image})
 
     if not entries:
@@ -807,9 +831,7 @@ def prepare_probes(container, metadata):
     if not readiness and not liveness and not startup:
         return "", ""
 
-    image = container.get("image", "")
-    if not (image.startswith("/cvmfs") or image.startswith("docker://")):
-        image = "docker://" + image
+    image = _resolve_image(container.get("image", ""))
     opts = singularity_options.split() if singularity_options else []
 
     probe_script = generate_probe_script(
@@ -1511,12 +1533,7 @@ def SubmitHandler():
                 container, metadata, container_standalone
             )
             env_flags = ["--env-file", f"./{env_file_name}"] if env_file_name else []
-            if container["image"].startswith("/cvmfs") or container["image"].startswith(
-                "docker://"
-            ):
-                image = container["image"]
-            else:
-                image = "docker://" + container["image"]
+            image = _resolve_image(container["image"])
             for mount in mounts[-1].split(","):
                 if "/cvmfs" not in mount:
                     mount_src = mount.split(":")[0]
@@ -1638,12 +1655,7 @@ def SubmitHandler():
             #        logging.warning(
             #            "image-uri not specified for path in remote filesystem"
             #        )
-            if container["image"].startswith("/cvmfs") or container["image"].startswith(
-                "docker://"
-            ):
-                image = container["image"]
-            else:
-                image = "docker://" + container["image"]
+            image = _resolve_image(container["image"])
             # image = container["image"]
             logging.info("Appending all commands together...")
             for mount in mounts[-1].split(","):
