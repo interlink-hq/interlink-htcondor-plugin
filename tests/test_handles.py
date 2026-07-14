@@ -884,7 +884,9 @@ class TestGeneratePreStopTrap:
 class TestPreStopTrapInScript:
     """Integration tests: preStop trap is injected into the generated script."""
 
-    def _container_with_prestop(self, name="c1", image="docker://busybox:latest", cmd=None):
+    def _container_with_prestop(
+        self, name="c1", image="docker://busybox:latest", cmd=None
+    ):
         if cmd is None:
             cmd = ["/bin/sh", "-c", "cleanup"]
         return {
@@ -991,7 +993,14 @@ class TestPostStartHelpers:
         assert handles._find_tmp_bind_in_tokens(tokens) == "/host/tmp"
 
     def test_find_tmp_bind_in_comma_spec(self):
-        tokens = ["singularity", "exec", "--bind", "/a:/b,/h/t:/tmp", "docker://img", "sh"]
+        tokens = [
+            "singularity",
+            "exec",
+            "--bind",
+            "/a:/b,/h/t:/tmp",
+            "docker://img",
+            "sh",
+        ]
         assert handles._find_tmp_bind_in_tokens(tokens) == "/h/t"
 
     def test_find_image_docker_prefix(self):
@@ -1105,7 +1114,9 @@ class TestPostStartInScript:
     def _poststart_hooks(self, container):
         lifecycle = container.get("lifecycle") or {}
         ps = lifecycle.get("postStart")
-        return {container["name"]: handles._translate_lifecycle_hook(ps) if ps else None}
+        return {
+            container["name"]: handles._translate_lifecycle_hook(ps) if ps else None
+        }
 
     def test_no_poststart_when_not_defined(self):
         container = _container("c1", "docker://busybox:latest")
