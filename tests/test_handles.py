@@ -597,24 +597,55 @@ class TestExpandCommandEnv:
         assert result == ["'$(UNKNOWN)'"]
 
 
-class TestAddMeshDaskHost:
+class TestConfigureMeshDaskWorker:
     def test_adds_mesh_interface_address(self):
         tokens = ["dask-worker", "tls://scheduler:8786", "--nthreads", "1"]
         mesh = "ip addr add 10.7.0.2/32 dev $WG_IFACE"
-        assert handles._add_mesh_dask_host(tokens, mesh) == tokens + [
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens + [
             "--host",
             "10.7.0.2",
+        ]
+
+    def test_adds_worker_contact_address(self):
+        tokens = ["dask-worker", "tls://scheduler:8786"]
+        mesh = """
+ip addr add 10.7.0.2/32 dev $WG_IFACE
+export INTERLINK_MESH_CONTACT_HOST="worker-tunnel.pods-wstunnel.svc.cluster.local"
+"""
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens + [
+            "--host",
+            "10.7.0.2",
+            "--worker-port",
+            "8788",
+            "--contact-address",
+            "tls://worker-tunnel.pods-wstunnel.svc.cluster.local:8788",
         ]
 
     def test_preserves_explicit_host(self):
         tokens = ["dask-worker", "tls://scheduler:8786", "--host", "10.8.0.2"]
         mesh = "ip addr add 10.7.0.2/32 dev $WG_IFACE"
-        assert handles._add_mesh_dask_host(tokens, mesh) == tokens
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens
+
+    def test_preserves_explicit_contact_options(self):
+        tokens = [
+            "dask-worker",
+            "tls://scheduler:8786",
+            "--worker-port",
+            "9000",
+            "--contact-address",
+            "tls://worker.example:9000",
+        ]
+        mesh = """
+ip addr add 10.7.0.2/32 dev $WG_IFACE
+export INTERLINK_MESH_CONTACT_HOST="worker-tunnel.pods-wstunnel.svc.cluster.local"
+"""
+        result = handles._configure_mesh_dask_worker(tokens, mesh)
+        assert result == tokens + ["--host", "10.7.0.2"]
 
     def test_ignores_non_dask_commands(self):
         tokens = ["python", "worker.py"]
         mesh = "ip addr add 10.7.0.2/32 dev $WG_IFACE"
-        assert handles._add_mesh_dask_host(tokens, mesh) == tokens
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens
 
 
 class TestPrepareEnvFile:

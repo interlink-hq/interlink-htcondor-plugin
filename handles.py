@@ -973,15 +973,35 @@ def _clean_command_tokens(tokens):
     return line.strip()
 
 
-def _add_mesh_dask_host(tokens, mesh_pre_exec):
-    """Bind Dask workers to the address configured on the mesh interface."""
-    if "dask-worker" not in tokens or "--host" in tokens:
+def _configure_mesh_dask_worker(tokens, mesh_pre_exec):
+    """Configure a Dask worker to listen on and advertise its mesh endpoints."""
+    if "dask-worker" not in tokens:
         return tokens
-    match = re.search(r"ip addr add ([0-9a-fA-F:.]+)/\d+ dev", mesh_pre_exec)
-    if not match:
+
+    host_match = re.search(r"ip addr add ([0-9a-fA-F:.]+)/\d+ dev", mesh_pre_exec)
+    if not host_match:
         return tokens
+
     result = list(tokens)
-    result.extend(["--host", match.group(1)])
+    if "--host" not in result:
+        result.extend(["--host", host_match.group(1)])
+
+    contact_match = re.search(
+        r'export INTERLINK_MESH_CONTACT_HOST="([^"]+)"', mesh_pre_exec
+    )
+    if not contact_match:
+        return result
+
+    if "--worker-port" in result:
+        port_index = result.index("--worker-port") + 1
+        worker_port = result[port_index] if port_index < len(result) else "8788"
+    else:
+        worker_port = "8788"
+        result.extend(["--worker-port", worker_port])
+
+    if "--contact-address" not in result:
+        contact_address = f"tls://{contact_match.group(1)}:{worker_port}"
+        result.extend(["--contact-address", contact_address])
     return result
 
 
@@ -1201,7 +1221,7 @@ def produce_htcondor_singularity_script(
             _mesh_wrapped = False
             for ctn_name, cmd_tokens in container_commands:
                 if mesh_pre_exec and not _mesh_wrapped:
-                    cmd_tokens = _add_mesh_dask_host(cmd_tokens, mesh_pre_exec)
+                    cmd_tokens = _configure_mesh_dask_worker(cmd_tokens, mesh_pre_exec)
                 hook = poststart_hooks.get(ctn_name)
                 if hook:
                     existing_tmp = _find_tmp_bind_in_tokens(cmd_tokens)
