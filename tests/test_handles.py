@@ -617,6 +617,75 @@ class TestCleanCommandTokens:
         assert '("", 8080)' in result
 
 
+class TestExpandCommandEnv:
+    def test_expands_kubernetes_env_reference(self):
+        container = {"env": [{"name": "DASK_GATEWAY_WORKER_NAME", "value": "worker-1"}]}
+        result = handles._expand_command_env(
+            ["--name", "$(DASK_GATEWAY_WORKER_NAME)"], container
+        )
+        assert result == ["--name", "worker-1"]
+
+    def test_quotes_expanded_value_with_spaces(self):
+        container = {"env": [{"name": "WORKER_NAME", "value": "worker one"}]}
+        result = handles._expand_command_env(["$(WORKER_NAME)"], container)
+        assert result == ["'worker one'"]
+
+    def test_quotes_unresolved_reference(self):
+        result = handles._expand_command_env(["$(UNKNOWN)"], {"env": []})
+        assert result == ["'$(UNKNOWN)'"]
+
+
+class TestConfigureMeshDaskWorker:
+    def test_adds_mesh_interface_address(self):
+        tokens = ["dask-worker", "tls://scheduler:8786", "--nthreads", "1"]
+        mesh = "ip addr add 10.7.0.2/32 dev $WG_IFACE"
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens + [
+            "--host",
+            "10.7.0.2",
+        ]
+
+    def test_adds_worker_contact_address(self):
+        tokens = ["dask-worker", "tls://scheduler:8786"]
+        mesh = """
+ip addr add 10.7.0.2/32 dev $WG_IFACE
+export INTERLINK_MESH_CONTACT_HOST="worker-tunnel.pods-wstunnel.svc.cluster.local"
+"""
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens + [
+            "--host",
+            "10.7.0.2",
+            "--worker-port",
+            "8788",
+            "--contact-address",
+            "tls://worker-tunnel.pods-wstunnel.svc.cluster.local:8788",
+        ]
+
+    def test_preserves_explicit_host(self):
+        tokens = ["dask-worker", "tls://scheduler:8786", "--host", "10.8.0.2"]
+        mesh = "ip addr add 10.7.0.2/32 dev $WG_IFACE"
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens
+
+    def test_preserves_explicit_contact_options(self):
+        tokens = [
+            "dask-worker",
+            "tls://scheduler:8786",
+            "--worker-port",
+            "9000",
+            "--contact-address",
+            "tls://worker.example:9000",
+        ]
+        mesh = """
+ip addr add 10.7.0.2/32 dev $WG_IFACE
+export INTERLINK_MESH_CONTACT_HOST="worker-tunnel.pods-wstunnel.svc.cluster.local"
+"""
+        result = handles._configure_mesh_dask_worker(tokens, mesh)
+        assert result == tokens + ["--host", "10.7.0.2"]
+
+    def test_ignores_non_dask_commands(self):
+        tokens = ["python", "worker.py"]
+        mesh = "ip addr add 10.7.0.2/32 dev $WG_IFACE"
+        assert handles._configure_mesh_dask_worker(tokens, mesh) == tokens
+
+
 class TestPrepareEnvFile:
     def test_prepare_env_file_writes_export_lines(self, tmp_path, monkeypatch):
         monkeypatch.setattr(

@@ -139,8 +139,34 @@ def _shell_single_quote(val):
     return "'" + str(val).replace("'", "'\"'\"'") + "'"
 
 
-def _wrap_command_with_env(command_tokens, env_file_name):
+_COMMAND_ENV_REF = re.compile(r"\$\(([A-Za-z_][A-Za-z0-9_]*)\)")
+
+
+def _expand_command_env(command_tokens, container):
+    """Expand Kubernetes-style ``$(VAR)`` references in command arguments."""
+    env = {
+        item["name"]: item.get("value") or ""
+        for item in container.get("env", [])
+        if "name" in item and item.get("value") is not None
+    }
+    expanded = []
+    for token in command_tokens:
+        matched = _COMMAND_ENV_REF.search(token)
+        if not matched:
+            expanded.append(token)
+            continue
+
+        value = _COMMAND_ENV_REF.sub(
+            lambda match: env.get(match.group(1), match.group(0)), token
+        )
+        expanded.append(shlex.quote(value))
+    return expanded
+
+
+def _wrap_command_with_env(command_tokens, env_file_name, container=None):
     """Source the generated env file inside the container, then exec the command."""
+    if container is not None:
+        command_tokens = _expand_command_env(command_tokens, container)
     if not env_file_name:
         return command_tokens
     return [
@@ -969,6 +995,38 @@ def _clean_command_tokens(tokens):
     return line.strip()
 
 
+def _configure_mesh_dask_worker(tokens, mesh_pre_exec):
+    """Configure a Dask worker to listen on and advertise its mesh endpoints."""
+    if "dask-worker" not in tokens:
+        return tokens
+
+    host_match = re.search(r"ip addr add ([0-9a-fA-F:.]+)/\d+ dev", mesh_pre_exec)
+    if not host_match:
+        return tokens
+
+    result = list(tokens)
+    if "--host" not in result:
+        result.extend(["--host", host_match.group(1)])
+
+    contact_match = re.search(
+        r'export INTERLINK_MESH_CONTACT_HOST="([^"]+)"', mesh_pre_exec
+    )
+    if not contact_match:
+        return result
+
+    if "--worker-port" in result:
+        port_index = result.index("--worker-port") + 1
+        worker_port = result[port_index] if port_index < len(result) else "8788"
+    else:
+        worker_port = "8788"
+        result.extend(["--worker-port", worker_port])
+
+    if "--contact-address" not in result:
+        contact_address = f"tls://{contact_match.group(1)}:{worker_port}"
+        result.extend(["--contact-address", contact_address])
+    return result
+
+
 def produce_htcondor_singularity_script(
     containers,
     metadata,
@@ -1184,6 +1242,8 @@ def produce_htcondor_singularity_script(
 
             _mesh_wrapped = False
             for ctn_name, cmd_tokens in container_commands:
+                if mesh_pre_exec and not _mesh_wrapped:
+                    cmd_tokens = _configure_mesh_dask_worker(cmd_tokens, mesh_pre_exec)
                 hook = poststart_hooks.get(ctn_name)
                 if hook:
                     existing_tmp = _find_tmp_bind_in_tokens(cmd_tokens)
@@ -1563,7 +1623,7 @@ def SubmitHandler():
                 local_mounts = [""]
             if "command" in container and "args" in container:
                 container_entrypoint = _wrap_command_with_env(
-                    container["command"] + container["args"], env_file_name
+                    container["command"] + container["args"], env_file_name, container
                 )
                 singularity_command = (
                     [pre_exec]
@@ -1575,7 +1635,7 @@ def SubmitHandler():
                 )
             elif "command" in container:
                 container_entrypoint = _wrap_command_with_env(
-                    container["command"], env_file_name
+                    container["command"], env_file_name, container
                 )
                 singularity_command = (
                     [pre_exec]
@@ -1587,7 +1647,7 @@ def SubmitHandler():
                 )
             elif "args" in container:
                 container_entrypoint = _wrap_command_with_env(
-                    container["args"], env_file_name
+                    container["args"], env_file_name, container
                 )
                 singularity_command = (
                     [pre_exec]
@@ -1692,7 +1752,7 @@ def SubmitHandler():
 
             if "command" in container.keys() and "args" in container.keys():
                 container_entrypoint = _wrap_command_with_env(
-                    container["command"] + container["args"], env_file_name
+                    container["command"] + container["args"], env_file_name, container
                 )
                 singularity_command = (
                     [pre_exec]
@@ -1704,7 +1764,7 @@ def SubmitHandler():
                 )
             elif "command" in container.keys():
                 container_entrypoint = _wrap_command_with_env(
-                    container["command"], env_file_name
+                    container["command"], env_file_name, container
                 )
                 singularity_command = (
                     [pre_exec]
@@ -1716,7 +1776,7 @@ def SubmitHandler():
                 )
             elif "args" in container.keys():
                 container_entrypoint = _wrap_command_with_env(
-                    container["args"], env_file_name
+                    container["args"], env_file_name, container
                 )
                 singularity_command = (
                     [pre_exec]
