@@ -176,6 +176,44 @@ class TestPrepareProbesImageHandling:
         probe_script, _ = prepare_probes(container, _BASE_METADATA)
         assert "docker://" not in probe_script
 
+    def test_configured_image_override(self, monkeypatch):
+        source = "registry.example/image:tag"
+        target = "/shared/images/image.sif"
+        monkeypatch.setitem(
+            handles.InterLinkConfigInst, "ImageOverrides", {source: target}
+        )
+        container = _container(
+            image=source,
+            livenessProbe={"httpGet": {"port": 8080}},
+        )
+        probe_script, _ = prepare_probes(container, _BASE_METADATA)
+        assert f'"{target}"' in probe_script
+        assert source not in probe_script
+
+
+class TestResolveImage:
+    def test_plain_image_gets_docker_prefix(self, monkeypatch):
+        monkeypatch.setitem(handles.InterLinkConfigInst, "ImageOverrides", {})
+        assert handles._resolve_image("busybox:latest") == "docker://busybox:latest"
+
+    def test_absolute_image_is_unchanged(self, monkeypatch):
+        monkeypatch.setitem(handles.InterLinkConfigInst, "ImageOverrides", {})
+        image = "/shared/images/busybox.sif"
+        assert handles._resolve_image(image) == image
+
+    def test_docker_prefixed_source_matches_plain_override(self, monkeypatch):
+        target = "/shared/images/busybox.sif"
+        monkeypatch.setitem(
+            handles.InterLinkConfigInst,
+            "ImageOverrides",
+            {"busybox:latest": target},
+        )
+        assert handles._resolve_image("docker://busybox:latest") == target
+
+    def test_invalid_override_config_is_ignored(self, monkeypatch):
+        monkeypatch.setitem(handles.InterLinkConfigInst, "ImageOverrides", [])
+        assert handles._resolve_image("busybox:latest") == "docker://busybox:latest"
+
 
 class TestPrepareProbesAnnotations:
     def test_singularity_options_from_annotation(self):
@@ -785,9 +823,7 @@ class TestGeneratePreStopTrap:
             {
                 "name": "c1",
                 "image": "busybox:latest",
-                "lifecycle": {
-                    "preStop": {"exec": {"command": ["true"]}}
-                },
+                "lifecycle": {"preStop": {"exec": {"command": ["true"]}}},
             }
         ]
         result = handles.generate_prestop_trap(containers, self._base_metadata())
@@ -846,7 +882,9 @@ class TestGeneratePreStopTrap:
 class TestPreStopTrapInScript:
     """Integration tests: preStop trap is injected into the generated script."""
 
-    def _container_with_prestop(self, name="c1", image="docker://busybox:latest", cmd=None):
+    def _container_with_prestop(
+        self, name="c1", image="docker://busybox:latest", cmd=None
+    ):
         if cmd is None:
             cmd = ["/bin/sh", "-c", "cleanup"]
         return {
@@ -857,9 +895,7 @@ class TestPreStopTrapInScript:
 
     def test_trap_in_script_when_prestop_defined(self):
         container = self._container_with_prestop()
-        prestop_trap = handles.generate_prestop_trap(
-            [container], _fake_metadata()
-        )
+        prestop_trap = handles.generate_prestop_trap([container], _fake_metadata())
         script = _make_script(
             [container],
             [("c1", ["singularity", "exec", "docker://busybox:latest", "sh"])],
@@ -953,7 +989,14 @@ class TestPostStartHelpers:
         assert handles._find_tmp_bind_in_tokens(tokens) == "/host/tmp"
 
     def test_find_tmp_bind_in_comma_spec(self):
-        tokens = ["singularity", "exec", "--bind", "/a:/b,/h/t:/tmp", "docker://img", "sh"]
+        tokens = [
+            "singularity",
+            "exec",
+            "--bind",
+            "/a:/b,/h/t:/tmp",
+            "docker://img",
+            "sh",
+        ]
         assert handles._find_tmp_bind_in_tokens(tokens) == "/h/t"
 
     def test_find_image_docker_prefix(self):
@@ -1067,7 +1110,9 @@ class TestPostStartInScript:
     def _poststart_hooks(self, container):
         lifecycle = container.get("lifecycle") or {}
         ps = lifecycle.get("postStart")
-        return {container["name"]: handles._translate_lifecycle_hook(ps) if ps else None}
+        return {
+            container["name"]: handles._translate_lifecycle_hook(ps) if ps else None
+        }
 
     def test_no_poststart_when_not_defined(self):
         container = _container("c1", "docker://busybox:latest")
