@@ -1493,8 +1493,39 @@ def SubmitHandler():
     containers = pod.get("spec", {}).get("containers", [])
     init_containers = pod.get("spec", {}).get("initContainers", [])
 
+    # CUSTOM JOB SCRIPT CASE
+    # When interLink provides a pre-built job script (data.JobScript != ""),
+    # write it to disk and submit it directly, mirroring the SLURM plugin
+    # behavior in Create.go.
+    job_script = create_request.get("jobScript", "")
+    if job_script:
+        abs_dataroot = os.path.realpath(InterLinkConfigInst["DataRootFolder"])
+        job_dir = os.path.join(
+            abs_dataroot,
+            f"{metadata['name']}-{metadata['uid']}",
+        )
+        os.makedirs(job_dir, exist_ok=True)
+        os.chmod(job_dir, 0o1777)
+
+        job_script_path = os.path.join(job_dir, "jobScript.sh")
+        with open(job_script_path, "w") as _f:
+            _f.write(job_script)
+        os.chmod(job_script_path, 0o770)
+
+        path = produce_htcondor_singularity_script(
+            containers,
+            metadata,
+            [("jobScript", ["./jobScript.sh"])],
+            [job_script_path],
+            probe_scripts=[],
+            cleanup_scripts=[],
+            init_container_commands=[],
+            prestop_trap=None,
+            poststart_hooks={},
+        )
+
     # NORMAL CASE
-    if "host" not in containers[0]["image"]:
+    elif "host" not in containers[0]["image"]:
         probe_scripts = []
         cleanup_scripts = []
         # container_commands collects (name, [tokens]) tuples for every container,

@@ -1254,6 +1254,161 @@ class TestCreateResponseFormat:
         assert "metadata" not in data
 
 
+class TestJobScriptPath:
+    """/create with a non-empty 'jobScript' field must write the script to disk,
+    submit it as a single 'jobScript' container via
+    produce_htcondor_singularity_script, and return HTTP 200 with the correct
+    PodUID/PodJID (mirrors SLURM plugin behavior)."""
+
+    _CUSTOM_SCRIPT = "#!/bin/bash\necho hello from custom script\n"
+
+    def _call_create_with_job_script(self, tmp_path, monkeypatch, job_script=None):
+        """POST /create with a pre-built job script payload."""
+        if job_script is None:
+            job_script = self._CUSTOM_SCRIPT
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "456.0")
+        monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
+        job_dir = tmp_path / "test-pod-uid-123"
+        job_dir.mkdir()
+        (job_dir / "test-pod-uid-123.jid").write_text("456.0")
+
+        # Capture the arguments passed to produce_htcondor_singularity_script
+        captured = {}
+
+        def _fake_produce(containers, metadata, container_commands, input_files, **kw):
+            captured["containers"] = containers
+            captured["container_commands"] = container_commands
+            captured["input_files"] = input_files
+            captured["kwargs"] = kw
+            return str(tmp_path / "fake.jdl")
+
+        monkeypatch.setattr(
+            handles, "produce_htcondor_singularity_script", _fake_produce
+        )
+        payload = _json.dumps(
+            {"pod": _make_pod(), "container": [], "jobScript": job_script}
+        )
+        resp = _flask_test_client().post(
+            "/create", data=payload, content_type="application/json"
+        )
+        return resp, captured
+
+    def test_job_script_written_to_disk(self, tmp_path, monkeypatch):
+        self._call_create_with_job_script(tmp_path, monkeypatch)
+        expected = tmp_path / "test-pod-uid-123" / "jobScript.sh"
+        assert expected.exists(), "jobScript.sh was not written to the job directory"
+        assert expected.read_text() == self._CUSTOM_SCRIPT
+
+    def test_job_script_is_executable(self, tmp_path, monkeypatch):
+        self._call_create_with_job_script(tmp_path, monkeypatch)
+        script_path = tmp_path / "test-pod-uid-123" / "jobScript.sh"
+        assert script_path.stat().st_mode & 0o100, "jobScript.sh is not executable"
+
+    def test_produce_called_with_single_jobscript_container(
+        self, tmp_path, monkeypatch
+    ):
+        _, captured = self._call_create_with_job_script(tmp_path, monkeypatch)
+        assert "container_commands" in captured
+        assert len(captured["container_commands"]) == 1
+        name, tokens = captured["container_commands"][0]
+        assert name == "jobScript"
+        assert tokens == ["./jobScript.sh"]
+
+    def test_produce_called_with_jobscript_in_input_files(self, tmp_path, monkeypatch):
+        _, captured = self._call_create_with_job_script(tmp_path, monkeypatch)
+        input_files = captured.get("input_files", [])
+        assert any("jobScript.sh" in f for f in input_files), (
+            f"jobScript.sh not in input_files: {input_files}"
+        )
+
+    def test_produce_called_with_no_probes(self, tmp_path, monkeypatch):
+        _, captured = self._call_create_with_job_script(tmp_path, monkeypatch)
+        kw = captured.get("kwargs", {})
+        assert kw.get("probe_scripts") == []
+        assert kw.get("cleanup_scripts") == []
+
+    def test_produce_called_with_no_init_containers(self, tmp_path, monkeypatch):
+        _, captured = self._call_create_with_job_script(tmp_path, monkeypatch)
+        kw = captured.get("kwargs", {})
+        assert kw.get("init_container_commands") == []
+
+    def test_returns_200_with_poduid_and_podjid(self, tmp_path, monkeypatch):
+        resp, _ = self._call_create_with_job_script(tmp_path, monkeypatch)
+        assert resp.status_code == 200
+        data = _json.loads(resp.data)
+        assert data["PodUID"] == "uid-123"
+        assert data["PodJID"] == "456.0"
+
+    def test_empty_job_script_falls_through_to_normal_path(
+        self, tmp_path, monkeypatch
+    ):
+        """An empty string jobScript must not activate the custom-script path."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "123.0")
+        monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
+        job_dir = tmp_path / "test-pod-uid-123"
+        job_dir.mkdir()
+        (job_dir / "test-pod-uid-123.jid").write_text("123.0")
+
+        called_with_jobscript_name = {}
+
+        def _fake_produce(containers, metadata, container_commands, input_files, **kw):
+            called_with_jobscript_name["names"] = [n for n, _ in container_commands]
+            return str(tmp_path / "fake.jdl")
+
+        monkeypatch.setattr(
+            handles, "produce_htcondor_singularity_script", _fake_produce
+        )
+        payload = _json.dumps(
+            {"pod": _make_pod(), "container": [], "jobScript": ""}
+        )
+        resp = _flask_test_client().post(
+            "/create", data=payload, content_type="application/json"
+        )
+        assert resp.status_code == 200
+        # Normal path uses container name "c1", not "jobScript"
+        assert "jobScript" not in called_with_jobscript_name.get("names", [])
+
+    def test_generated_script_uses_runctn_for_jobscript(self, tmp_path, monkeypatch):
+        """Full integration: the generated bash script must use runCtn jobScript."""
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        monkeypatch.setattr(handles, "htcondor_batch_submit", lambda path: "789.0")
+        monkeypatch.setattr(handles, "handle_jid", lambda jid, pod: None)
+
+        job_dir = tmp_path / "test-pod-uid-123"
+        job_dir.mkdir()
+        (job_dir / "test-pod-uid-123.jid").write_text("789.0")
+
+        payload = _json.dumps(
+            {
+                "pod": _make_pod(),
+                "container": [],
+                "jobScript": self._CUSTOM_SCRIPT,
+            }
+        )
+        resp = _flask_test_client().post(
+            "/create", data=payload, content_type="application/json"
+        )
+        assert resp.status_code == 200
+
+        sh_path = job_dir / "test-pod-uid-123.sh"
+        script = sh_path.read_text()
+        assert "runCtn jobScript ./jobScript.sh" in script
+
+
 class TestStatusHandlerMultiPod:
     """/status must return statuses for ALL pods in the request array."""
 
