@@ -1392,10 +1392,24 @@ def delete_pod(pod):
     jid_path = os.path.join(job_dir, f"{name}-{uid}.jid")
     with open(jid_path) as f:
         data = f.read()
-    jid = int(data.strip())
-    process = os.popen(f"condor_rm {jid}")
-    preprocessed = process.read()
-    process.close()
+    jid_raw = data.strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?", jid_raw):
+        raise ValueError(f"Invalid job id in {jid_path}: {jid_raw!r}")
+    cluster_id = jid_raw.split(".")[0]
+
+    collector = args.collector_host
+    schedd = args.schedd_host
+    if collector and schedd:
+        cmd = ["condor_rm", "-pool", collector, "-name", schedd, cluster_id]
+    else:
+        cmd = ["condor_rm", cluster_id]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"condor_rm failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+    preprocessed = result.stdout
 
     # Remove job directory contents
     try:
