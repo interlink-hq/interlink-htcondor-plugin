@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from datetime import datetime
 
@@ -1397,41 +1398,11 @@ def delete_pod(pod):
     preprocessed = process.read()
     process.close()
 
-    # Remove job directory contents
-    try:
-        os.remove(os.path.join(job_dir, f"{name}-{uid}.jid"))
-    except FileNotFoundError:
-        pass
-    try:
-        os.remove(os.path.join(job_dir, f"{name}-{uid}.sh"))
-    except FileNotFoundError:
-        pass
-    try:
-        os.remove(os.path.join(job_dir, f"{name}-{uid}.jdl"))
-    except FileNotFoundError:
-        pass
-    try:
-        os.remove(os.path.join(job_dir, f"{name}-{uid}_env.env"))
-    except FileNotFoundError:
-        pass
-
-    # Clean up per-container log files transferred back by HTCondor inside job dir.
-    try:
-        with os.scandir(job_dir) as it:
-            for entry in it:
-                if entry.name.startswith(f"{name}-{uid}-") and entry.name.endswith(
-                    ".out"
-                ):
-                    os.remove(entry.path)
-    except OSError as e:
-        logging.warning(f"Could not clean up log files for {name}-{uid}: {e}")
-
-    # Optionally remove the job directory if empty
-    try:
-        os.rmdir(job_dir)
-    except OSError:
-        # Directory not empty or other error — leave it in place
-        pass
+    data_root = os.path.realpath(datarootfolder)
+    job_dir_real = os.path.realpath(job_dir)
+    if not job_dir_real.startswith(data_root + os.sep):
+        raise ValueError(f"Job directory escapes data root: {job_dir!r}")
+    shutil.rmtree(job_dir_real)
 
     return preprocessed
 

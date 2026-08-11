@@ -1461,3 +1461,34 @@ class TestSystemInfoEndpoint:
         data = _json.loads(resp.data)
         assert data["htcondor_connected"] is False
         assert data["status"] == "warning"
+
+
+class TestDeletePod:
+    def test_removes_complete_job_directory(self, tmp_path, monkeypatch):
+        name = "worker"
+        uid = "abc-123"
+        job_dir = tmp_path / f"{name}-{uid}"
+        (job_dir / "secrets" / "credentials").mkdir(parents=True)
+        (job_dir / "log").mkdir()
+        (job_dir / f"{name}-{uid}.jid").write_text("123")
+        (job_dir / "secrets" / "credentials" / "token").write_text("secret")
+        (job_dir / "log" / "job.log").write_text("finished")
+
+        class FakeProcess:
+            def read(self):
+                return "Job 123 removed"
+
+            def close(self):
+                return None
+
+        monkeypatch.setitem(
+            handles.InterLinkConfigInst, "DataRootFolder", str(tmp_path)
+        )
+        monkeypatch.setattr(handles.os, "popen", lambda command: FakeProcess())
+
+        result = handles.delete_pod(
+            {"metadata": {"name": name, "uid": uid, "namespace": "default"}}
+        )
+
+        assert result == "Job 123 removed"
+        assert not job_dir.exists()
