@@ -107,9 +107,11 @@ echo "✓ htcondor-sidecar image built"
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Downloading interLink binaries ==="
-# 0.6.1-pre6 is the latest release that is compatible with this plugin
-# (v0.6.1+ API).  Override INTERLINK_VERSION to pin a different release.
-INTERLINK_VERSION="${INTERLINK_VERSION:-0.6.1-pre6}"
+# 0.6.2 is the minimum required release for this plugin — it includes the
+# log-forwarding fix (isSafeURL localhost regression, PR #515) and pod-status
+# mutex fix (PR #490) that are needed for the e2e test suite to pass.
+# Override INTERLINK_VERSION to pin a different release.
+INTERLINK_VERSION="${INTERLINK_VERSION:-0.6.2}"
 RELEASE_BASE="https://github.com/interlink-hq/interLink/releases/download/${INTERLINK_VERSION}"
 
 curl -fsSL "${RELEASE_BASE}/interlink_Linux_x86_64" \

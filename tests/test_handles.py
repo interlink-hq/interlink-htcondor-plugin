@@ -646,6 +646,72 @@ class TestPrepareEnvFile:
         assert wrapped[:4] == ["/bin/sh", "-c", '. ./env.env && exec "$@"', "sh"]
         assert wrapped[4:] == ["python", "-c", "print('ok')"]
 
+    def test_envfrom_secretref_decodes_base64_values(self, tmp_path, monkeypatch):
+        import base64
+
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        username_b64 = base64.b64encode(b"test").decode("utf-8")
+        password_b64 = base64.b64encode(b"s3cr3t!").decode("utf-8")
+        container_standalone = {
+            "name": "c1",
+            "secrets": [
+                {
+                    "metadata": {"name": "mysecret"},
+                    "data": {"username": username_b64, "password": password_b64},
+                }
+            ],
+            "configMaps": [],
+        }
+        env_file_name, env_path = handles.prepare_env_file(
+            {
+                "name": "c1",
+                "envFrom": [{"secretRef": {"name": "mysecret"}}],
+            },
+            {"name": "pod-b", "uid": "uid-b"},
+            container_standalone=container_standalone,
+        )
+        assert env_path is not None
+        with open(env_path) as f:
+            content = f.read()
+        assert "export username='test'" in content
+        assert "export password='s3cr3t!'" in content
+        assert username_b64 not in content
+        assert password_b64 not in content
+
+    def test_envfrom_configmapref_writes_plain_values(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+        container_standalone = {
+            "name": "c1",
+            "secrets": [],
+            "configMaps": [
+                {
+                    "metadata": {"name": "my-configmap"},
+                    "data": {"test": "1", "mode": "production"},
+                }
+            ],
+        }
+        env_file_name, env_path = handles.prepare_env_file(
+            {
+                "name": "c1",
+                "envFrom": [{"configMapRef": {"name": "my-configmap"}}],
+            },
+            {"name": "pod-c", "uid": "uid-c"},
+            container_standalone=container_standalone,
+        )
+        assert env_path is not None
+        with open(env_path) as f:
+            content = f.read()
+        assert "export test='1'" in content
+        assert "export mode='production'" in content
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle hook tests — _translate_lifecycle_hook, generate_prestop_trap,
@@ -1381,7 +1447,7 @@ class TestLogsHandler:
 
         seen = {}
 
-        def fake_run(cmd, capture_output, text, timeout):
+        def fake_run(cmd, capture_output, text, timeout, **kwargs):
             seen["cmd"] = cmd
 
             class Result:
@@ -1408,6 +1474,45 @@ class TestLogsHandler:
         assert resp.status_code == 200
         assert resp.data.decode() == "probe log line\n"
         assert seen["cmd"][-1] == "pod-a-uid-a-main.out"
+
+    def test_getlogs_reads_transferred_file_with_utf8(self, tmp_path, monkeypatch):
+        """LogsHandler must decode transferred log files as UTF-8.
+
+        In containers where the system locale is POSIX/ASCII (LANG=C), Python's
+        default file encoding would be ASCII.  Falling back to ASCII corrupts
+        multi-byte characters like the Unicode CHECK MARK ✓ (U+2713, UTF-8 bytes
+        E2 9C 93) into three replacement chars, breaking regex matches that
+        contain that character.  The fix is to open the file with an explicit
+        encoding="utf-8" argument.
+        """
+        monkeypatch.setattr(
+            handles,
+            "InterLinkConfigInst",
+            {"DataRootFolder": str(tmp_path) + "/"},
+        )
+
+        job_dir = tmp_path / "pod-b-uid-b"
+        job_dir.mkdir()
+        # No .jid file → condor_tail skipped; fallback to the transferred file.
+        log_file = job_dir / "pod-b-uid-b-ctn.out"
+        unicode_content = "✓ DATABASE_URL: postgresql://localhost/db\nSUCCESS\n"
+        log_file.write_bytes(unicode_content.encode("utf-8"))
+
+        resp = _flask_test_client().get(
+            "/getLogs",
+            data=_json.dumps(
+                {
+                    "PodName": "pod-b",
+                    "PodUID": "uid-b",
+                    "ContainerName": "ctn",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        assert resp.status_code == 200
+        body = resp.data.decode("utf-8")
+        assert "✓ DATABASE_URL: postgresql" in body
 
 
 class TestSystemInfoEndpoint:

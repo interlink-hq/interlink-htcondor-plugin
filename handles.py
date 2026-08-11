@@ -1,5 +1,6 @@
 import argparse
 import base64
+import binascii
 import json
 import logging
 import math
@@ -189,8 +190,20 @@ def prepare_env_file(container, metadata, container_standalone=None):
                     for secret in secrets_list:
                         if secret.get("metadata", {}).get("name") == ref_name:
                             for k, v in secret.get("data", {}).items():
+                                if not v:
+                                    decoded = ""
+                                else:
+                                    try:
+                                        decoded = base64.b64decode(v).decode("utf-8")
+                                    except (binascii.Error, UnicodeDecodeError):
+                                        logging.warning(
+                                            f"Secret '{ref_name}' key '{k}'"
+                                            " could not be base64-decoded;"
+                                            " using raw value"
+                                        )
+                                        decoded = v
                                 lines.append(
-                                    f"export {k}={_shell_single_quote(v or '')}"
+                                    f"export {k}={_shell_single_quote(decoded)}"
                                 )
                 elif "configMapRef" in env_from:
                     ref_name = env_from["configMapRef"].get("name", "")
@@ -2092,7 +2105,12 @@ def LogsHandler():
                             sandbox_log_filename,
                         ]
                     result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=60
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=60,
                     )
                     if result.stdout:
                         content = result.stdout
@@ -2126,7 +2144,7 @@ def LogsHandler():
                 return "", 400
             logging.info(f"GetLogs: reading transferred file {log_file_real}")
             try:
-                with open(log_file_real, "r", errors="replace") as fh:
+                with open(log_file_real, "r", encoding="utf-8", errors="replace") as fh:
                     content = fh.read()
             except FileNotFoundError:
                 logging.info(f"GetLogs: log file not found yet: {log_file_real}")
