@@ -158,10 +158,6 @@ def access_token_from_request(call):
         f"client_id={claims.get('client_id')} iss={claims.get('iss')} "
         f"aud={claims.get('aud')} exp={claims.get('exp')}"
     )
-    # DEBUGGING AID - writes a live bearer credential to the log. Kept at
-    # DEBUG so it stays silent unless PLUGIN_LOG_LEVEL=DEBUG is set. Anyone
-    # who can read these logs can replay the token until it expires.
-    logging.debug(f"{call}: {ACCESS_TOKEN_HEADER}: {token}")
     return token
 
 
