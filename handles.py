@@ -10,7 +10,7 @@ import subprocess
 from datetime import datetime
 
 import yaml
-from flask import Flask, jsonify, request
+from flask import Flask, g, has_request_context, jsonify, request
 from probes import (
     generate_probe_cleanup_script,
     generate_probe_script,
@@ -67,11 +67,35 @@ if args.proxy != "":
 dummy_job = args.dummy_job
 
 
+# Without this, nothing below WARNING is ever printed: the root logger is
+# unconfigured, so every logging.info()/logging.debug() call in this file goes
+# to the "last resort" handler, which drops anything under WARNING. The access
+# logs that do appear come from werkzeug, which configures its own logger.
+logging.basicConfig(
+    level=os.environ.get("PLUGIN_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+
 global JID
 JID = []
 
 # Maximum bytes to retrieve per condor_tail call (10 MiB).
 _CONDOR_TAIL_MAX_BYTES = 10 * 1024 * 1024
+
+# How long to let an HTCondor client command run before giving up. Without a
+# cap, an unreachable collector or a stalled security handshake blocks the
+# worker thread until the client's own timeout fires, and /system-info - which
+# the container healthcheck calls - stops answering long enough to be declared
+# unhealthy. The status probe gets a much shorter budget than the rest for
+# exactly that reason: it has to answer quickly even when the pool is down.
+_CONDOR_COMMAND_TIMEOUT = 60
+# condor_tail sits directly under `kubectl logs`, so it gets a much smaller
+# budget than the rest: a user waiting on log output would rather be told
+# nothing is available than watch the call block for a minute.
+_CONDOR_TAIL_TIMEOUT = 15
+_CONDOR_STATUS_TIMEOUT = 5
+_CONDOR_SUBMIT_TIMEOUT = 120
 
 
 def read_yaml_file(file_path):
@@ -88,6 +112,178 @@ global InterLinkConfigInst
 interlink_config_path = "./SidecarConfig.yaml"
 InterLinkConfigInst = read_yaml_file(interlink_config_path)
 print("Interlink configuration info:", InterLinkConfigInst)
+
+
+# Header the interLink API server forwards the caller's access token in. It
+# originates from the authenticating proxy in front of interLink
+# (oauth2-proxy's pass_access_token option), which verified it: signature,
+# issuer, audience, expiry, and the allow-list in its own config.
+ACCESS_TOKEN_HEADER = "X-Forwarded-Access-Token"
+
+
+def decode_token_claims(token):
+    """Return the claims of a JWT as a dict, without verifying anything.
+
+    The signature is NOT checked here, and must not be relied on: this is only
+    safe because the token already passed verification at the proxy, and
+    nothing can reach interLink - let alone this plugin - without crossing it.
+    If the plugin is ever exposed directly, this has to become a real
+    verification against the issuer's JWKS.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # restore the stripped padding
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception as e:  # malformed token: not worth failing the request
+        logging.warning(f"Could not decode access token claims: {e}")
+        return {}
+
+
+def access_token_from_request(call):
+    """Read the caller's access token off the current request and log who it
+    identifies. Returns "" when the header is absent, which is the case for
+    any deployment with no authenticating proxy in front of interLink."""
+    token = request.headers.get(ACCESS_TOKEN_HEADER, "")
+    # Stash it on the Flask request context so that any helper further down
+    # can reach it with g.access_token, without threading it through every
+    # call signature. It is cleared at the end of each request.
+    g.access_token = token
+    if not token:
+        logging.debug(f"{call}: no {ACCESS_TOKEN_HEADER} header on the request")
+        return ""
+
+    claims = decode_token_claims(token)
+    logging.info(
+        f"{call}: caller sub={claims.get('sub')} "
+        f"client_id={claims.get('client_id')} iss={claims.get('iss')} "
+        f"aud={claims.get('aud')} exp={claims.get('exp')}"
+    )
+    return token
+
+
+def condor_env():
+    """Environment for the HTCondor client commands.
+
+    A copy of the process environment with the caller's access token added as
+    BEARER_TOKEN, which is where HTCondor's SCITOKENS authentication looks for
+    it (the WLCG bearer token discovery protocol, same as
+    `export BEARER_TOKEN=$(oidc-token ...)` by hand).
+
+    Built fresh per call rather than written into os.environ on purpose: the
+    server handles requests concurrently, each carrying a different caller's
+    token, and a process-wide variable would let one tenant submit with
+    another tenant's credential.
+
+    With no token on the request the environment is returned unchanged, so the
+    plugin keeps using whatever credential --auth-method and --proxy set up at
+    startup.
+    """
+    env = os.environ.copy()
+    token = getattr(g, "access_token", "") if has_request_context() else ""
+    if token:
+        env["BEARER_TOKEN"] = token
+
+    # The htcondor/mini base image pins NETWORK_INTERFACE to 127.0.0.1, so its
+    # bundled single-node pool stays on loopback. That also binds every
+    # outbound socket to loopback, and connecting to a remote collector from
+    # such a socket fails with EINVAL - "connect errno = 22" - which the
+    # client retries in silence for 60 seconds before giving up with a
+    # generic "Failed to connect". Override it for the client commands
+    # whenever a remote pool is configured; the bundled daemons keep the
+    # image's own configuration.
+    if args.collector_host and "_condor_NETWORK_INTERFACE" not in env:
+        env["_condor_NETWORK_INTERFACE"] = "*"
+
+    return env
+
+
+def condor_remote_args(with_schedd=True):
+    """-pool/-name arguments addressing the configured remote pool.
+
+    Returns [] when no remote pool is configured, so the same call sites work
+    against a local one. Without these, condor_q/condor_rm/condor_history go
+    to the *local* schedd and report nothing about jobs that were submitted
+    remotely - the job runs fine and the plugin simply cannot see it.
+
+    The schedd is addressed by its ad name, which is not always the CE's
+    hostname: --schedd-name overrides --schedd-host for that reason.
+    """
+    collector = args.collector_host
+    schedd = args.schedd_name or args.schedd_host
+    if not collector:
+        return []
+    if with_schedd and schedd:
+        return ["-pool", collector, "-name", schedd]
+    return ["-pool", collector]
+
+
+def condor_output(cmd, merge_stderr=False, timeout=_CONDOR_COMMAND_TIMEOUT):
+    """Run an HTCondor client command and return its stdout.
+
+    Takes the command as a list, so no shell is involved and job ids read back
+    from disk cannot be interpreted as shell syntax. Returns "" if the command
+    times out, which every caller already treats the same way as empty output.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+            text=True,
+            env=condor_env(),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        logging.error(f"{cmd[0]} timed out after {timeout}s: {' '.join(cmd)}")
+        return ""
+    return result.stdout
+
+
+def transfer_spooled_output(cluster_id, job_dir):
+    """Fetch a finished job's output files out of the schedd's spool.
+
+    Submission uses -spool, so when the job ends HTCondor delivers its output
+    files to the *schedd's* spool directory, not to this machine:
+
+        Iwd = /var/lib/condor-ce/spool/69/0/cluster69.proc0.subproc0
+
+    condor_transfer_data moves them the last hop. It writes into the current
+    working directory, hence cwd=job_dir, which is where the rest of the
+    plugin already expects to find them.
+
+    This is a one-shot: once the data has been transferred the job leaves the
+    queue, so the copy in job_dir becomes the only copy. Callers must check
+    that the file is not already there before calling.
+    """
+    cmd = ["condor_transfer_data"] + condor_remote_args() + [str(cluster_id)]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=condor_env(),
+            timeout=_CONDOR_COMMAND_TIMEOUT,
+            cwd=job_dir,
+        )
+    except subprocess.TimeoutExpired:
+        logging.error(
+            f"condor_transfer_data timed out after {_CONDOR_COMMAND_TIMEOUT}s"
+            f" for cluster {cluster_id}"
+        )
+        return False
+
+    if result.returncode != 0:
+        # Routine for a job that is still running - its output has not been
+        # spooled yet - so this is not an error.
+        logging.info(
+            f"GetLogs: condor_transfer_data rc={result.returncode}"
+            f" ({result.stderr.strip()!r})"
+        )
+        return False
+
+    logging.info(f"GetLogs: transferred spooled output for cluster {cluster_id}")
+    return True
 
 
 def error_response(message, status_code=500):
@@ -1346,23 +1542,52 @@ def htcondor_batch_submit(job):
         raise ValueError(f"Submit file path escapes data root: {job!r}")
 
     collector = args.collector_host
-    schedd = args.schedd_host
+    # -remote takes the schedd's *ad name* and looks it up in the collector;
+    # it is not an address and does not accept host:port. The name is usually
+    # the CE's hostname, but not always - "Can't find address of schedd X"
+    # means the collector returned no ad called X, either because the name
+    # differs or because the collector refused the query. Use --schedd-name
+    # to give the real ad name when it is not the hostname; `condor_status
+    # -pool <collector> -schedd` lists them.
+    schedd = args.schedd_name or args.schedd_host
     if collector and schedd:
         # Remote submission: forward the job to a specific pool and schedd.
+        #
+        # "-name X -spool", not "-remote X". The two are meant to be
+        # equivalent - the manual describes -remote as submitting to a named
+        # schedd and spooling the input files - but -name is the form the CE
+        # documentation gives and the form condor_ce_ping accepts, and -remote
+        # failed the collector lookup against this CE with "Can't find address
+        # of schedd" for a name that -name resolves.
+        #
+        # Every option goes before the submit file, also as documented:
+        # condor_submit parses trailing arguments as further submit files or
+        # key=value overrides, not as options.
         cmd = [
             "condor_submit",
+            "-spool",
             "-pool",
             collector,
-            "-remote",
+            "-name",
             schedd,
             job_real,
-            "-spool",
         ]
     else:
         # Local submission: use the schedd discovered from the local HTCondor pool.
         cmd = ["condor_submit", job_real]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=condor_env(),
+            timeout=_CONDOR_SUBMIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"condor_submit timed out after {_CONDOR_SUBMIT_TIMEOUT}s"
+        ) from e
     if result.returncode != 0:
         raise RuntimeError(
             f"condor_submit failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -1393,9 +1618,7 @@ def delete_pod(pod):
     with open(jid_path) as f:
         data = f.read()
     jid = int(data.strip())
-    process = os.popen(f"condor_rm {jid}")
-    preprocessed = process.read()
-    process.close()
+    preprocessed = condor_output(["condor_rm"] + condor_remote_args() + [str(jid)])
 
     # Remove job directory contents
     try:
@@ -1454,6 +1677,7 @@ def handle_jid(jid, pod):
 def SubmitHandler():
     # READ THE REQUEST ###############
     logging.info("HTCondor Sidecar: received Submit call")
+    access_token_from_request("create")
 
     try:
         request_data_string = request.data.decode("utf-8")
@@ -1797,6 +2021,7 @@ def SubmitHandler():
 def StopHandler():
     # READ THE REQUEST ######
     logging.info("HTCondor Sidecar: received Stop call")
+    access_token_from_request("delete")
     try:
         request_data_string = request.data.decode("utf-8")
         req = json.loads(request_data_string)
@@ -1836,6 +2061,7 @@ def StopHandler():
 def StatusHandler():
     # READ THE REQUEST #####################
     logging.info("HTCondor Sidecar: received GetStatus call")
+    access_token_from_request("status")
     try:
         request_data_string = request.data.decode("utf-8")
         req_list = json.loads(request_data_string)
@@ -1886,14 +2112,15 @@ def StatusHandler():
             podnamespace = req["metadata"].get("namespace", "default")
             poduid = req["metadata"]["uid"]
             # Query HTCondor for job status
-            process = os.popen(f"condor_q {jid_job} --json")
-            preprocessed = process.read()
-            process.close()
+            remote = condor_remote_args()
+            preprocessed = condor_output(
+                ["condor_q"] + remote + [jid_job, "--json"]
+            )
             if not preprocessed.strip():
                 # Job not found in queue, check history
-                process = os.popen(f"condor_history {jid_job} --json")
-                preprocessed = process.read()
-                process.close()
+                preprocessed = condor_output(
+                    ["condor_history"] + remote + [jid_job, "--json"]
+                )
             if not preprocessed.strip():
                 logging.error(f"Job {jid_job} not found in HTCondor queue or history")
                 continue
@@ -1997,6 +2224,7 @@ def StatusHandler():
 
 def LogsHandler():
     logging.info("HTCondor Sidecar: received GetLogs call")
+    access_token_from_request("getLogs")
     try:
         request_data_string = request.data.decode("utf-8")
         req = json.loads(request_data_string)
@@ -2051,6 +2279,7 @@ def LogsHandler():
         content = None
 
         # --- Try condor_tail first (no shared filesystem required) ---
+        cluster_id = None
         job_dir = os.path.join(
             os.path.realpath(datarootfolder), f"{parts['PodName']}-{parts['PodUID']}"
         )
@@ -2069,30 +2298,22 @@ def LogsHandler():
                     # the HTCondor networking protocol; works for running jobs and
                     # recently-completed jobs whose sandbox has not yet been cleaned.
                     # proc_id is digits + ".0"; log_filename is validated by _safe.
-                    collector = args.collector_host
-                    schedd = args.schedd_host
-                    if collector and schedd:
-                        cmd = [
-                            "condor_tail",
-                            "-pool",
-                            collector,
-                            "-name",
-                            schedd,
+                    cmd = (
+                        ["condor_tail"]
+                        + condor_remote_args()
+                        + [
                             "-maxbytes",
                             str(_CONDOR_TAIL_MAX_BYTES),
                             proc_id,
                             sandbox_log_filename,
                         ]
-                    else:
-                        cmd = [
-                            "condor_tail",
-                            "-maxbytes",
-                            str(_CONDOR_TAIL_MAX_BYTES),
-                            proc_id,
-                            sandbox_log_filename,
-                        ]
+                    )
                     result = subprocess.run(
-                        cmd, capture_output=True, text=True, timeout=60
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=_CONDOR_TAIL_TIMEOUT,
+                        env=condor_env(),
                     )
                     if result.stdout:
                         content = result.stdout
@@ -2111,6 +2332,18 @@ def LogsHandler():
                     )
             except Exception as e:
                 logging.info(f"GetLogs: condor_tail failed ({e}), falling back to file")
+
+        # --- Pull the spooled output down from the schedd ------------------
+        # Only worth trying once: condor_transfer_data drops the job from the
+        # queue, after which the local copy is all there is.
+        if (
+            content is None
+            and cluster_id
+            and cluster_id.isdigit()
+            and condor_remote_args()
+            and not os.path.exists(transferred_log_path)
+        ):
+            transfer_spooled_output(cluster_id, job_dir)
 
         # --- Fall back to the HTCondor-transferred copy in the data root ---
         # After the job completes, HTCondor transfers the sandbox file back to
@@ -2151,6 +2384,7 @@ def SystemInfoHandler():
     with status, timestamp, and the condensed condor_status output.
     """
     logging.info("HTCondor Sidecar: received SystemInfo call")
+    access_token_from_request("system-info")
 
     response = {
         "status": "ok",
@@ -2159,9 +2393,15 @@ def SystemInfoHandler():
     }
 
     try:
-        process = os.popen("condor_status -totals 2>&1")
-        output = process.read()
-        process.close()
+        # "-total", not "-totals": the plural spelling has not been a valid
+        # flag since HTCondor 9, so this call used to fail on every pool and
+        # htcondor_connected was always reported false.
+        # condor_status queries the collector, so no -name here.
+        output = condor_output(
+            ["condor_status"] + condor_remote_args(with_schedd=False) + ["-total"],
+            merge_stderr=True,
+            timeout=_CONDOR_STATUS_TIMEOUT,
+        )
         if "TotalMachines" in output or "Machines" in output or "Slots" in output:
             response["htcondor_connected"] = True
             response["condor_status_output"] = output.strip()
